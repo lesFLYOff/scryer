@@ -990,6 +990,31 @@ pub(crate) async fn link_recycled_file_to_exact_destination(
     }
 }
 
+/// Restore across filesystems onto `original_path`, replacing whatever file
+/// holds that name. The restored copy is proven before the recycled source is
+/// removed; an unproven restore is removed and the recycled copy is kept, so
+/// the file is never lost.
+async fn restore_over_by_verified_copy(
+    recycled_path: &Path,
+    original_path: &Path,
+    progress: CopyProgress,
+) -> AppResult<()> {
+    let claim = match tokio::fs::symlink_metadata(original_path).await {
+        Ok(_) => DestinationClaim::AlreadyHeld,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DestinationClaim::ClaimHere,
+        Err(error) => {
+            return Err(AppError::Repository(format!(
+                "failed to inspect restore destination {}: {}",
+                original_path.display(),
+                error
+            )));
+        }
+    };
+    quick_verified_copy(recycled_path, original_path, claim, progress).await?;
+    let _ = crate::fs_safety::remove_file_safely_if_exists(recycled_path).await;
+    Ok(())
+}
+
 async fn restore_from_recycle_inner(
     recycled_path: &Path,
     original_path: &Path,
@@ -1026,27 +1051,8 @@ async fn restore_from_recycle_inner(
     match tokio::fs::rename(recycled_path, original_path).await {
         Ok(()) => {}
         Err(error) if crate::fs_safety::is_cross_device_error(&error) => {
-            // Cross-device restore cannot rename. Prove the restored copy is
-            // identical before removing the recycled source; on mismatch,
-            // remove the bad restore and keep the recycled copy so the file
-            // is never lost.
-            tokio::fs::copy(recycled_path, original_path)
-                .await
-                .map_err(|copy_error| {
-                    AppError::Repository(format!(
-                        "failed to restore {} to {}: {}",
-                        recycled_path.display(),
-                        original_path.display(),
-                        copy_error
-                    ))
-                })?;
-            if let Err(verify_error) =
-                crate::fs_integrity::verify_same_file_async(recycled_path, original_path).await
-            {
-                let _ = crate::fs_safety::remove_file_safely_if_exists(original_path).await;
-                return Err(verify_error);
-            }
-            let _ = crate::fs_safety::remove_file_safely_if_exists(recycled_path).await;
+            restore_over_by_verified_copy(recycled_path, original_path, CopyProgress::none())
+                .await?;
         }
         Err(error) => {
             return Err(AppError::Repository(format!(
@@ -3227,6 +3233,77 @@ mod tests {
             !result.recycled_path.exists(),
             "recycled source should be removed after verified restore"
         );
+    }
+
+    #[tokio::test]
+    async fn restore_over_by_copy_replaces_the_occupant_and_removes_the_recycled_copy() {
+        let tmp = TempDir::new().unwrap();
+        let recycled = tmp.path().join("bin").join("sample-feature.mkv");
+        let original = tmp.path().join("library").join("sample-feature.mkv");
+        let bystander = tmp.path().join("library").join("other-feature.mkv");
+        tokio::fs::create_dir_all(recycled.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(original.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&recycled, b"recycled bytes")
+            .await
+            .unwrap();
+        tokio::fs::write(&original, b"the occupant, which is longer")
+            .await
+            .unwrap();
+        tokio::fs::write(&bystander, b"unrelated").await.unwrap();
+
+        restore_over_by_verified_copy(&recycled, &original, CopyProgress::none())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&original).unwrap(), b"recycled bytes");
+        assert!(!recycled.exists(), "the proven restore replaces the copy");
+        assert_eq!(std::fs::read(&bystander).unwrap(), b"unrelated");
+    }
+
+    #[tokio::test]
+    async fn restore_over_by_copy_fills_an_absent_destination() {
+        let tmp = TempDir::new().unwrap();
+        let recycled = tmp.path().join("sample-feature.recycled");
+        let original = tmp.path().join("sample-feature.mkv");
+        tokio::fs::write(&recycled, b"recycled bytes")
+            .await
+            .unwrap();
+
+        restore_over_by_verified_copy(&recycled, &original, CopyProgress::none())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&original).unwrap(), b"recycled bytes");
+        assert!(!recycled.exists());
+    }
+
+    #[tokio::test]
+    async fn restore_over_by_copy_keeps_the_recycled_copy_when_the_restore_does_not_match() {
+        let tmp = TempDir::new().unwrap();
+        let recycled = tmp.path().join("sample-feature.recycled");
+        let original = tmp.path().join("sample-feature.mkv");
+        tokio::fs::write(&recycled, b"recycled bytes")
+            .await
+            .unwrap();
+
+        let error = restore_over_by_verified_copy(
+            &recycled,
+            &original,
+            damage_when_verification_starts(&original, b"damaged"),
+        )
+        .await
+        .expect_err("an unproven restore must fail");
+
+        assert!(
+            error.to_string().contains("copy verification failed"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(std::fs::read(&recycled).unwrap(), b"recycled bytes");
+        assert!(!original.exists(), "the unproven restore is removed");
     }
 
     #[tokio::test]
