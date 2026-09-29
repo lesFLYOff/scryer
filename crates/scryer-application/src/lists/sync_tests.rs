@@ -1260,3 +1260,102 @@ async fn an_add_is_recorded_even_when_the_sync_breaks_off_after_it() {
     assert!(row.added_by_list, "the list's add is remembered");
     assert_eq!(row.title_id.as_deref(), Some("title-alpha"));
 }
+
+fn movie_exclusion(key: &str) -> scryer_domain::ListExclusion {
+    scryer_domain::ListExclusion {
+        id: format!("exclusion-{key}"),
+        kind: scryer_domain::MediaFacet::Movie,
+        external_ids: vec![crate::lists::test_support::tmdb(&format!("{key}-id"))],
+        display_title: format!("Fixture Title {key}"),
+        year: None,
+        scope: scryer_domain::ListExclusionScope::AllLists,
+        created_by_user_id: None,
+        created_at: at(0),
+    }
+}
+
+#[tokio::test]
+async fn a_title_deleted_without_an_exclusion_is_added_again_on_the_next_sync() {
+    let harness = Harness::new(vec![subscription("list-a")]);
+    harness.lists.serve("list-a", &["alpha", "beta"]);
+    harness.sync_at(at(0)).await;
+    assert_eq!(add_calls(&harness.actions), 2);
+
+    harness
+        .actions
+        .missing_titles
+        .lock()
+        .unwrap()
+        .insert("title-alpha".to_string());
+    // The provider reports the list unchanged; the deleted title is still work.
+    let report = harness.sync_at(at(6 * 60)).await;
+
+    let added_again = harness
+        .actions
+        .calls()
+        .into_iter()
+        .filter(|call| matches!(call, RecordedAction::Add { item_key, .. } if item_key == "alpha"))
+        .count();
+    assert_eq!(added_again, 2);
+    assert_eq!(add_calls(&harness.actions), 3, "beta is still there");
+    assert_eq!(report.added, 1);
+    let row = harness.store.row("list-a", "alpha");
+    assert_eq!(row.state, ListMembershipState::Added);
+    assert_eq!(row.title_id.as_deref(), Some("title-alpha"));
+    assert!(row.added_by_list);
+}
+
+#[tokio::test]
+async fn a_title_deleted_with_an_exclusion_stays_gone() {
+    let harness = Harness::new(vec![subscription("list-a")]);
+    harness.lists.serve("list-a", &["alpha"]);
+    harness.sync_at(at(0)).await;
+
+    harness
+        .actions
+        .missing_titles
+        .lock()
+        .unwrap()
+        .insert("title-alpha".to_string());
+    harness
+        .store
+        .exclusions
+        .lock()
+        .unwrap()
+        .push(movie_exclusion("alpha"));
+    harness.sync_at(at(6 * 60)).await;
+
+    assert_eq!(add_calls(&harness.actions), 1);
+    let row = harness.store.row("list-a", "alpha");
+    assert_eq!(row.state, ListMembershipState::Excluded);
+    assert_eq!(row.title_id, None);
+    assert!(
+        !row.added_by_list,
+        "the list no longer owns a deleted title"
+    );
+}
+
+#[tokio::test]
+async fn a_title_the_list_added_that_is_still_present_is_not_added_twice() {
+    let harness = Harness::new(vec![subscription("list-a")]);
+    harness.lists.serve("list-a", &["alpha"]);
+    harness.sync_at(at(0)).await;
+
+    // Unchanged list, title still in the library: nothing to read again.
+    harness.sync_at(at(6 * 60)).await;
+    // A changed list reads alpha again; its title is still there.
+    harness.lists.serve("list-a", &["alpha", "beta"]);
+    harness.sync_at(at(12 * 60)).await;
+
+    let alpha_adds = harness
+        .actions
+        .calls()
+        .into_iter()
+        .filter(|call| matches!(call, RecordedAction::Add { item_key, .. } if item_key == "alpha"))
+        .count();
+    assert_eq!(alpha_adds, 1);
+    let row = harness.store.row("list-a", "alpha");
+    assert_eq!(row.state, ListMembershipState::Added);
+    assert_eq!(row.title_id.as_deref(), Some("title-alpha"));
+    assert!(row.added_by_list);
+}

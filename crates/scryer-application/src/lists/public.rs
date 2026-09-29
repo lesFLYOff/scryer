@@ -32,7 +32,8 @@ use super::gateway::{
 };
 use super::ports::ListSubscriptionQuery;
 use super::resolve::resolve_items;
-use super::runtime::AppListLibraryLookup;
+use super::runtime::{AppListActions, AppListLibraryLookup};
+use super::sync::{deleted_additions, without_rows};
 use crate::jobs::JobKey;
 use crate::url_redaction::{redact_optional_url_credentials, redact_url_credentials};
 use crate::{AppError, AppResult, AppUseCase, MediaRequestQuery};
@@ -700,7 +701,14 @@ impl AppUseCase {
         fetched.dedupe();
         let resolved = resolve_items(&subscription, fetched.items, &resolver).await?;
         let exclusions = lists.exclusions.list().await?;
-        let evaluated = evaluate(&subscription, resolved, &exclusions, &existing);
+        // Weigh a deleted title the list added the way the sync will.
+        let deleted = deleted_additions(&AppListActions::new(self), &resolved, &existing).await;
+        let evaluated = evaluate(
+            &subscription,
+            resolved,
+            &exclusions,
+            &without_rows(&existing, &deleted),
+        );
         let mut preview = summarize_preview(&evaluated, &fetched.posters);
         preview.recognized = true;
         preview.provider = Some(subscription.source.provider.clone());

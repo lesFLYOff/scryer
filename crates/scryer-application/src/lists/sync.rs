@@ -10,8 +10,9 @@
 //!
 //! A provider's "unchanged" answer skips the rest of the sync, unless the list
 //! still has work: settings edited since its last sync, items the per-sync cap
-//! left pending, or an on-leave action that has not run. Then the whole list
-//! is read again and processed.
+//! left pending, a title the list added that has since been deleted, or an
+//! on-leave action that has not run. Then the whole list is read again and
+//! processed.
 //!
 //! Subscriptions run one after another, so an instance never has two fetches
 //! in flight against the same provider.
@@ -326,7 +327,15 @@ pub async fn sync_subscription(
         .map(|row| (row.item_key.clone(), row))
         .collect::<HashMap<_, _>>();
     let exclusions = context.exclusions.list().await?;
-    let evaluated = evaluate(subscription, resolved, &exclusions, &existing);
+    // A title the list added and that has since been deleted from the library
+    // is weighed again as if new; only an exclusion keeps it out.
+    let deleted = deleted_additions(context.actions, &resolved, &existing).await;
+    let evaluated = evaluate(
+        subscription,
+        resolved,
+        &exclusions,
+        &without_rows(&existing, &deleted),
+    );
 
     // A member whose list policy needs approval gets requests that wait for
     // review, whatever their grants and the request rules would allow.
@@ -339,6 +348,12 @@ pub async fn sync_subscription(
     for evaluated in evaluated {
         let previous = existing.get(&evaluated.item.item.item_key);
         let mut row = membership_row(subscription, &evaluated.item, previous, now);
+        if deleted.contains(&row.item_key) {
+            // The title the list added is gone, so the row no longer names it
+            // and the list no longer owns anything through it.
+            row.title_id = None;
+            row.added_by_list = false;
+        }
         match evaluated.decision {
             ItemDecision::Excluded => row.state = ListMembershipState::Excluded,
             ItemDecision::Filtered { reason } => {
@@ -451,6 +466,49 @@ pub async fn sync_subscription(
     })
 }
 
+/// The item keys whose membership says the list added a title that is no
+/// longer in the library. Only rows still on the list and marked `Added` are
+/// checked, and only when the item did not already match that same title. A
+/// lookup that fails counts as the title being present, so a passing storage
+/// error never re-adds anything.
+pub(super) async fn deleted_additions(
+    actions: &dyn ListActions,
+    items: &[super::resolve::ResolvedItem],
+    existing: &HashMap<String, ListMembership>,
+) -> HashSet<String> {
+    let mut deleted = HashSet::new();
+    for item in items {
+        let Some(row) = existing.get(&item.item.item_key) else {
+            continue;
+        };
+        if row.left_at.is_some() || row.state != ListMembershipState::Added {
+            continue;
+        }
+        let Some(title_id) = row.title_id.as_deref() else {
+            continue;
+        };
+        if item.library_title_id.as_deref() == Some(title_id) {
+            continue;
+        }
+        if !actions.title_exists(title_id).await.unwrap_or(true) {
+            deleted.insert(row.item_key.clone());
+        }
+    }
+    deleted
+}
+
+/// `existing` without the rows named in `keys`.
+pub(super) fn without_rows(
+    existing: &HashMap<String, ListMembership>,
+    keys: &HashSet<String>,
+) -> HashMap<String, ListMembership> {
+    existing
+        .iter()
+        .filter(|(key, _)| !keys.contains(*key))
+        .map(|(key, row)| (key.clone(), row.clone()))
+        .collect()
+}
+
 /// Whether a list may still act, read again from the store: a sync runs long
 /// enough for its list to be disabled or unfollowed underneath it.
 enum SubscriptionStanding {
@@ -519,8 +577,9 @@ fn next_sync_at(subscription: &ListSubscription, now: DateTime<Utc>) -> DateTime
 
 /// Whether a list the provider reports as unchanged still has work a sync
 /// must do: settings edited since its last sync, items the per-sync cap left
-/// pending, or a departure whose on-leave action has not run and could run
-/// now. A departure another list still holds back is not work yet.
+/// pending, a title the list added that has since been deleted, or a
+/// departure whose on-leave action has not run and could run now. A departure
+/// another list still holds back is not work yet.
 async fn has_unfinished_work(
     context: &ListSyncContext<'_>,
     subscription: &ListSubscription,
@@ -537,6 +596,17 @@ async fn has_unfinished_work(
         .any(|row| row.left_at.is_none() && row.state == ListMembershipState::Pending)
     {
         return Ok(true);
+    }
+    // A title the list added was deleted from the library: the next sync
+    // weighs it again, so the list must be read.
+    for row in &rows {
+        if row.left_at.is_none()
+            && row.state == ListMembershipState::Added
+            && let Some(title_id) = row.title_id.as_deref()
+            && !context.actions.title_exists(title_id).await.unwrap_or(true)
+        {
+            return Ok(true);
+        }
     }
     has_runnable_leave_action(
         subscription,
