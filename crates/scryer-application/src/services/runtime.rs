@@ -2467,6 +2467,7 @@ impl NavigationBadgeSection {
 
 #[derive(Clone)]
 pub struct AppRuntimeSecurityState {
+    pub(crate) default_admin_disabled: Arc<std::sync::atomic::AtomicBool>,
     pub(super) recovery_admin_login_enabled: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) trusted_proxies: crate::rate_limit_proxy_policy::TrustedProxyRuntime,
     pub(crate) service_settings_lock: Arc<tokio::sync::Mutex<()>>,
@@ -2513,6 +2514,7 @@ impl AppRuntimeState {
                 supported_plugin_required_features,
             ),
             security: AppRuntimeSecurityState {
+                default_admin_disabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 recovery_admin_login_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 trusted_proxies: Default::default(),
                 service_settings_lock: Default::default(),
