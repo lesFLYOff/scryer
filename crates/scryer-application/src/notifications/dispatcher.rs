@@ -42,8 +42,8 @@ macro_rules! notification_event_mappings {
             import_rejected => DomainEventPayload::ImportRejected(_) => DomainEventPayload::ImportRejected(data) => DomainEventType::ImportRejected => NotificationEventType::ImportRejected => build_import_rejected_notification(data),
             media_file_upgraded => DomainEventPayload::MediaFileUpgraded(_) => DomainEventPayload::MediaFileUpgraded(data) => DomainEventType::MediaFileUpgraded => NotificationEventType::Upgrade => build_media_file_upgraded_notification(data),
             media_file_renamed => DomainEventPayload::MediaFileRenamed(_) => DomainEventPayload::MediaFileRenamed(data) => DomainEventType::MediaFileRenamed => NotificationEventType::Rename => build_media_file_renamed_notification(data),
-            media_file_deleted_upgrade => DomainEventPayload::MediaFileDeleted(MediaFileDeletedEventData { reason: MediaFileDeletedReason::UpgradeCleanup, .. }) => DomainEventPayload::MediaFileDeleted(data @ MediaFileDeletedEventData { reason: MediaFileDeletedReason::UpgradeCleanup, .. }) => DomainEventType::MediaFileDeleted => NotificationEventType::FileDeletedForUpgrade => build_media_file_deleted_notification(data, NotificationEventType::FileDeletedForUpgrade),
-            media_file_deleted => DomainEventPayload::MediaFileDeleted(MediaFileDeletedEventData { reason: MediaFileDeletedReason::Deleted | MediaFileDeletedReason::MissingOnDisk, .. }) => DomainEventPayload::MediaFileDeleted(data @ MediaFileDeletedEventData { reason: MediaFileDeletedReason::Deleted | MediaFileDeletedReason::MissingOnDisk, .. }) => DomainEventType::MediaFileDeleted => NotificationEventType::FileDeleted => build_media_file_deleted_notification(data, NotificationEventType::FileDeleted),
+            media_file_deleted_upgrade => DomainEventPayload::MediaFileDeleted(MediaFileDeletedEventData { reason: MediaFileDeletedReason::UpgradeCleanup | MediaFileDeletedReason::RecycleBinPurgedAfterUpgrade, .. }) => DomainEventPayload::MediaFileDeleted(data @ MediaFileDeletedEventData { reason: MediaFileDeletedReason::UpgradeCleanup | MediaFileDeletedReason::RecycleBinPurgedAfterUpgrade, .. }) => DomainEventType::MediaFileDeleted => NotificationEventType::FileDeletedForUpgrade => build_media_file_deleted_notification(data, NotificationEventType::FileDeletedForUpgrade),
+            media_file_deleted => DomainEventPayload::MediaFileDeleted(MediaFileDeletedEventData { reason: MediaFileDeletedReason::Deleted | MediaFileDeletedReason::MissingOnDisk | MediaFileDeletedReason::RecycleBinPurged, .. }) => DomainEventPayload::MediaFileDeleted(data @ MediaFileDeletedEventData { reason: MediaFileDeletedReason::Deleted | MediaFileDeletedReason::MissingOnDisk | MediaFileDeletedReason::RecycleBinPurged, .. }) => DomainEventType::MediaFileDeleted => NotificationEventType::FileDeleted => build_media_file_deleted_notification(data, NotificationEventType::FileDeleted),
             media_file_restored => DomainEventPayload::MediaFileRestored(_) => DomainEventPayload::MediaFileRestored(data) => DomainEventType::MediaFileRestored => NotificationEventType::FileRestored => build_media_file_restored_notification(data),
             post_processing_completed => DomainEventPayload::PostProcessingCompleted(_) => DomainEventPayload::PostProcessingCompleted(data) => DomainEventType::PostProcessingCompleted => NotificationEventType::PostProcessingCompleted => build_post_processing_completed_notification(data),
             subtitle_downloaded => DomainEventPayload::SubtitleDownloaded(_) => DomainEventPayload::SubtitleDownloaded(data) => DomainEventType::SubtitleDownloaded => NotificationEventType::SubtitleDownloaded => build_subtitle_downloaded_notification(data),
@@ -214,6 +214,20 @@ async fn dispatch_event(app: &AppUseCase, event: &DomainEvent) {
     let _ = try_dispatch_event(app, event).await;
 }
 
+/// Whether this event travels the durable, retrying delivery path.
+///
+/// Durability is a property of the event, not a gap waiting to be filled. An event belongs here only
+/// when it describes a state that is still true when the retry lands: "imports are blocked for disk
+/// space" stays true until it is not, so re-sending it after a channel outage is correct. A one-shot
+/// event — a grab, a subtitle search failure — is a moment whose value decays, so retrying it either
+/// announces stale news or multiplies a high-volume family into a storm. Everything else stays
+/// fire-and-forget: the failure is logged and the offset moves on.
+///
+/// Widening this predicate also widens its head-of-line behaviour. `dispatch_pending_space_events`
+/// returns on the first failure without advancing its offset, so a single broken channel holds back
+/// every event behind it until the attempt ceiling abandons it. That is tolerable while the blast
+/// radius is one family; applied to every event it would let one misconfigured webhook stall the
+/// whole notification pipeline.
 fn is_import_space_event(event_type: DomainEventType) -> bool {
     matches!(
         event_type,
@@ -325,6 +339,18 @@ async fn try_dispatch_event(app: &AppUseCase, event: &DomainEvent) -> crate::App
     subscriptions.dedup_by(|left, right| left.id == right.id);
     let mut dispatched_targets = BTreeSet::new();
 
+    // A recycle-bin purge removes a copy that an upgrade had already replaced,
+    // not the file currently at the original path: by the time the recycled
+    // copy expires that path can hold the replacement. Forwarding the deletion
+    // as a media-server refresh would tell Jellyfin/Plex/Emby to drop a path
+    // that is still in use, so purge notifications stay off media-server
+    // targets. Channel subscribers keep the file payload and are told about the
+    // purge itself.
+    let media_file_purge = matches!(
+        &event.payload,
+        DomainEventPayload::MediaFileDeleted(data) if data.reason.is_recycle_bin_purge()
+    );
+
     for subscription in subscriptions {
         if !subscription.is_enabled {
             continue;
@@ -336,6 +362,17 @@ async fn try_dispatch_event(app: &AppUseCase, event: &DomainEvent) -> crate::App
             scope_title_id,
             scope_facet,
         ) {
+            continue;
+        }
+
+        if media_file_purge
+            && subscription.target_kind == NotificationTargetKind::MediaServerConnection
+        {
+            debug!(
+                subscription_id = subscription.id.as_str(),
+                target_id = subscription.target_id.as_str(),
+                "skipping media-server refresh for a recycle-bin purge"
+            );
             continue;
         }
 
@@ -830,7 +867,8 @@ fn build_media_file_deleted_notification(
         .first()
         .map(|update| update.path.as_str());
     let title = match data.reason {
-        MediaFileDeletedReason::UpgradeCleanup => {
+        MediaFileDeletedReason::UpgradeCleanup
+        | MediaFileDeletedReason::RecycleBinPurgedAfterUpgrade => {
             format!("Deleted for upgrade: {}", data.title.title_name)
         }
         MediaFileDeletedReason::RecycleBinPurged => {
@@ -847,6 +885,10 @@ fn build_media_file_deleted_notification(
         ),
         MediaFileDeletedReason::RecycleBinPurged => format!(
             "Permanently deleted recycled media file: {}",
+            first_path.unwrap_or("(path unavailable)")
+        ),
+        MediaFileDeletedReason::RecycleBinPurgedAfterUpgrade => format!(
+            "Permanently deleted the recycled copy an upgrade had replaced: {}",
             first_path.unwrap_or("(path unavailable)")
         ),
         MediaFileDeletedReason::Deleted | MediaFileDeletedReason::MissingOnDisk => {
@@ -911,6 +953,7 @@ fn build_post_processing_completed_notification(
         &[],
         &[],
     );
+    payload.severity = Some(post_processing_severity(data.result));
     payload.import = Some(NotificationImportPayload {
         status: Some(
             match data.result {
@@ -923,6 +966,16 @@ fn build_post_processing_completed_notification(
         ..Default::default()
     });
     BuiltNotification { payload }
+}
+
+/// A script that timed out or failed is not routine news, and the event type alone cannot say which
+/// one happened.
+fn post_processing_severity(result: PostProcessingResult) -> NotificationSeverityPayload {
+    match result {
+        PostProcessingResult::Succeeded => NotificationSeverityPayload::Info,
+        PostProcessingResult::TimedOut => NotificationSeverityPayload::Warning,
+        PostProcessingResult::Failed => NotificationSeverityPayload::Error,
+    }
 }
 
 fn build_subtitle_downloaded_notification(data: &SubtitleDownloadedEventData) -> BuiltNotification {
@@ -1193,6 +1246,8 @@ fn title_payload_from_context(title: &TitleContextSnapshot) -> NotificationTitle
             mal_ids: Vec::new(),
             kitsu_ids: Vec::new(),
             by_source: external_ids_by_source_from_snapshot(title),
+            // The snapshot has no kind to build one from; see the helper above.
+            by_source_key: BTreeMap::new(),
         },
     }
 }
@@ -1300,7 +1355,7 @@ async fn enrich_notification(
             .map(|user_id| NotificationActorPayload {
                 user_id: Some(user_id.clone()),
             });
-    notification.payload.severity = Some(notification_severity(notification.payload.event_type));
+    notification.payload.severity = Some(resolve_severity(&notification.payload));
     notification.payload.is_test =
         matches!(notification.payload.event_type, NotificationEventType::Test);
 
@@ -1323,6 +1378,14 @@ async fn enrich_notification(
     enrich_release_from_media_files(&mut notification.payload);
 
     notification
+}
+
+/// A builder that knows more than the event type — a post-processing result, say — may set severity
+/// itself. An explicit value wins; otherwise severity stays a pure function of the event type.
+fn resolve_severity(payload: &NotificationPayload) -> NotificationSeverityPayload {
+    payload
+        .severity
+        .unwrap_or_else(|| notification_severity(payload.event_type))
 }
 
 fn notification_severity(event_type: NotificationEventType) -> NotificationSeverityPayload {
@@ -1729,6 +1792,12 @@ fn external_ids_payload_from_title(title: &Title) -> NotificationExternalIdsPayl
             .entry("imdb".to_string())
             .or_default()
             .push(imdb_id.clone());
+        // A bare `imdb_id` column has no kind of its own, so the key omits that segment.
+        payload
+            .by_source_key
+            .entry("imdb".to_string())
+            .or_default()
+            .push(ExternalId::new("imdb", imdb_id.clone()).key());
     }
 
     for external_id in &title.external_ids {
@@ -1749,6 +1818,13 @@ fn push_external_id(payload: &mut NotificationExternalIdsPayload, external_id: &
         .entry(source.clone())
         .or_default()
         .push(external_id.value.clone());
+    // `key()` normalises the kind and omits the segment when it is unknown, so this stays a valid
+    // unambiguous identifier even for ids that predate the kind field.
+    payload
+        .by_source_key
+        .entry(source.clone())
+        .or_default()
+        .push(external_id.key());
 
     match source.as_str() {
         "tmdb" if payload.tmdb_id.is_none() => payload.tmdb_id = Some(external_id.value.clone()),
@@ -1765,6 +1841,10 @@ fn push_external_id(payload: &mut NotificationExternalIdsPayload, external_id: &
     }
 }
 
+/// The event snapshot carries no entity kind, so `by_source_key` cannot be built from this path.
+/// Events that only have the snapshot — media requests, and the fallback title context — therefore
+/// still report the ambiguous `(source, value)` pair, and nothing here can change that without
+/// widening `DomainExternalIds`, which is persisted inside every domain event.
 fn external_ids_by_source_from_snapshot(
     title: &TitleContextSnapshot,
 ) -> BTreeMap<String, Vec<String>> {
@@ -2000,6 +2080,58 @@ mod tests {
         assert!(supported.contains(&NotificationEventType::MediaRequestCanceled));
     }
 
+    /// Event types that are wired through the enum, the plugin SDK, the plugin descriptor and the
+    /// settings labels, but that no domain event produces yet. Keeping them declared is deliberate:
+    /// a published plugin may already ask for them. Nothing can send one, so nothing subscribes.
+    const RESERVED_NOTIFICATION_EVENT_TYPES: &[NotificationEventType] = &[
+        // Reserved for the application self-update flow.
+        NotificationEventType::ApplicationUpdate,
+        // Reserved for work that needs an operator to intervene before it can proceed.
+        NotificationEventType::ManualInteractionRequired,
+    ];
+
+    /// Every event type must be exactly one of: produced by a domain event, deliberately reserved, or
+    /// the test button's own value. A new enum variant fails this until it is placed, and a reserved
+    /// variant that becomes producible fails it too - which is how health_issue and health_restored
+    /// should have been reclassified when the disk-space family landed.
+    #[test]
+    fn every_notification_event_type_is_classified() {
+        let dispatchable = supported_notification_event_types();
+
+        for event_type in NotificationEventType::all() {
+            let buckets = [
+                dispatchable.contains(event_type),
+                RESERVED_NOTIFICATION_EVENT_TYPES.contains(event_type),
+                *event_type == NotificationEventType::Test,
+            ];
+            let matched = buckets.iter().filter(|in_bucket| **in_bucket).count();
+            assert_eq!(
+                matched,
+                1,
+                "{} is classified {} times; it must be dispatchable, reserved, or test-only",
+                event_type.as_str(),
+                matched
+            );
+        }
+    }
+
+    /// Reserved values and the test value must stay unsubscribable, or the settings surface offers
+    /// events that can never fire.
+    #[test]
+    fn reserved_and_test_event_types_are_not_subscribable() {
+        let subscribable = supported_notification_event_types();
+        for event_type in RESERVED_NOTIFICATION_EVENT_TYPES
+            .iter()
+            .chain(std::iter::once(&NotificationEventType::Test))
+        {
+            assert!(
+                !subscribable.contains(event_type),
+                "{} must not be subscribable",
+                event_type.as_str()
+            );
+        }
+    }
+
     #[test]
     fn matches_scope_accepts_any_selected_facet_in_csv_scope_id() {
         assert!(matches_scope(
@@ -2020,6 +2152,194 @@ mod tests {
             None,
             Some("anime")
         ));
+    }
+
+    fn post_processing_event(result: PostProcessingResult) -> DomainEvent {
+        DomainEvent {
+            sequence: 12,
+            event_id: "evt-post-processing".to_string(),
+            occurred_at: Utc::now(),
+            actor_kind: DomainEventActorKind::System,
+            actor_user_id: None,
+            actor_display_name: "System".to_string(),
+            title_id: Some("title-1".to_string()),
+            facet: Some(MediaFacet::Movie),
+            correlation_id: None,
+            causation_id: None,
+            schema_version: 1,
+            stream: scryer_domain::DomainEventStream::Global,
+            payload: DomainEventPayload::PostProcessingCompleted(
+                PostProcessingCompletedEventData {
+                    title: title_context("Post Processed Movie", MediaFacet::Movie),
+                    script_name: "notify.sh".to_string(),
+                    result,
+                    exit_code: Some(1),
+                },
+            ),
+        }
+    }
+
+    /// A script that failed used to be announced with the same severity as one that succeeded,
+    /// because severity was derived from the event type alone.
+    #[test]
+    fn post_processing_severity_follows_the_script_result() {
+        for (result, expected) in [
+            (
+                PostProcessingResult::Succeeded,
+                NotificationSeverityPayload::Info,
+            ),
+            (
+                PostProcessingResult::TimedOut,
+                NotificationSeverityPayload::Warning,
+            ),
+            (
+                PostProcessingResult::Failed,
+                NotificationSeverityPayload::Error,
+            ),
+        ] {
+            let built = build_notification(&post_processing_event(result))
+                .expect("post-processing payload should build a notification");
+            assert_eq!(
+                resolve_severity(&built.payload),
+                expected,
+                "post-processing result {result:?} was announced as the wrong severity"
+            );
+        }
+    }
+
+    /// Only a builder that knows more than the event type may set a severity. Everything else stays
+    /// unset, so `resolve_severity` keeps deriving it from the event type.
+    #[test]
+    fn only_the_post_processing_builder_sets_an_explicit_severity() {
+        for event in notification_sample_events() {
+            let built = build_notification(&event).expect("sample payload should build");
+            let is_post_processing =
+                built.payload.event_type == NotificationEventType::PostProcessingCompleted;
+            assert_eq!(
+                built.payload.severity.is_some(),
+                is_post_processing,
+                "unexpected explicit severity for {}",
+                built.payload.event_type.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_severity_prefers_an_explicit_value_and_falls_back_to_the_event_type() {
+        let mut payload = base_notification_payload(
+            NotificationEventType::PostProcessingCompleted,
+            "summary".to_string(),
+            "message".to_string(),
+            None,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            resolve_severity(&payload),
+            NotificationSeverityPayload::Info
+        );
+
+        payload.severity = Some(NotificationSeverityPayload::Error);
+        assert_eq!(
+            resolve_severity(&payload),
+            NotificationSeverityPayload::Error
+        );
+
+        let submitted = base_notification_payload(
+            NotificationEventType::SubtitleSearchFailed,
+            "summary".to_string(),
+            "message".to_string(),
+            None,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            resolve_severity(&submitted),
+            NotificationSeverityPayload::Error
+        );
+    }
+
+    fn path_update(path: &str, update_type: MediaUpdateType) -> MediaPathUpdate {
+        MediaPathUpdate {
+            path: path.to_string(),
+            update_type,
+        }
+    }
+
+    fn primary_path_of(updates: &[MediaPathUpdate]) -> Option<String> {
+        file_payload(updates).and_then(|payload| payload.primary_path)
+    }
+
+    /// A rename reports the old path first and the new one second (library/rename.rs), so taking the
+    /// first update would hand plugins the path of a file that no longer exists.
+    #[test]
+    fn a_renames_primary_path_is_the_surviving_file() {
+        let old = path_update("/library/Old/movie.mkv", MediaUpdateType::Deleted);
+        let new = path_update("/library/New/movie.mkv", MediaUpdateType::Created);
+
+        assert_eq!(
+            primary_path_of(&[old.clone(), new.clone()]),
+            Some(new.path.clone())
+        );
+        assert_eq!(
+            primary_path_of(&[new.clone(), old]),
+            Some(new.path.clone()),
+            "the created path wins whatever order the producer reported"
+        );
+    }
+
+    /// A rename must keep reporting both paths; only the primary path changes meaning.
+    #[test]
+    fn a_rename_still_reports_every_path_in_order() {
+        let payload = file_payload(&[
+            path_update("/library/Old/movie.mkv", MediaUpdateType::Deleted),
+            path_update("/library/New/movie.mkv", MediaUpdateType::Created),
+        ])
+        .expect("two updates should produce a file section");
+
+        assert_eq!(
+            payload.primary_path.as_deref(),
+            Some("/library/New/movie.mkv")
+        );
+        assert_eq!(
+            payload
+                .media_updates
+                .iter()
+                .map(|update| update.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/library/Old/movie.mkv", "/library/New/movie.mkv"]
+        );
+    }
+
+    /// Events without a created update — import, upgrade, delete — keep reporting the first path.
+    #[test]
+    fn a_primary_path_falls_back_to_the_first_update() {
+        for update_type in [
+            MediaUpdateType::Created,
+            MediaUpdateType::Modified,
+            MediaUpdateType::Deleted,
+        ] {
+            assert_eq!(
+                primary_path_of(&[path_update("/library/movie.mkv", update_type)]),
+                Some("/library/movie.mkv".to_string()),
+                "single {update_type:?} update should be the primary path"
+            );
+        }
+
+        assert_eq!(
+            primary_path_of(&[
+                path_update("/library/one.mkv", MediaUpdateType::Deleted),
+                path_update("/library/two.mkv", MediaUpdateType::Deleted),
+            ]),
+            Some("/library/one.mkv".to_string()),
+            "with no created update the first path still wins"
+        );
+
+        assert_eq!(
+            primary_path_of(&[]),
+            None,
+            "no updates means no file section"
+        );
     }
 
     fn notification_sample_events() -> Vec<DomainEvent> {
@@ -2739,6 +3059,47 @@ mod tests {
 
         assert!(!payload.by_source.contains_key("smg"));
         assert_eq!(payload.tmdb_id.as_deref(), Some("603"));
+    }
+
+    /// `by_source` keeps the ambiguous pair on purpose: it is the shape plugins already receive, so it
+    /// is not worth breaking. `by_source_key` is the form that survives the ambiguity the domain
+    /// documents for `ExternalId`.
+    #[test]
+    fn external_id_keys_carry_the_entity_kind() {
+        let mut payload = NotificationExternalIdsPayload::default();
+        push_external_id(
+            &mut payload,
+            &ExternalId::with_kind("tvdb", "series", "307111"),
+        );
+        push_external_id(
+            &mut payload,
+            &ExternalId::with_kind("tvdb", "movie", "7373"),
+        );
+
+        assert_eq!(
+            payload.by_source.get("tvdb"),
+            Some(&vec!["307111".to_string(), "7373".to_string()])
+        );
+        assert_eq!(
+            payload.by_source_key.get("tvdb"),
+            Some(&vec![
+                "tvdb:series:307111".to_string(),
+                "tvdb:movie:7373".to_string()
+            ])
+        );
+        assert_eq!(payload.tvdb_id.as_deref(), Some("307111"));
+    }
+
+    /// Ids written before the kind field existed must still produce a usable key.
+    #[test]
+    fn an_external_id_without_a_kind_still_gets_a_key() {
+        let mut payload = NotificationExternalIdsPayload::default();
+        push_external_id(&mut payload, &ExternalId::new("imdb", "tt0111161"));
+
+        assert_eq!(
+            payload.by_source_key.get("imdb"),
+            Some(&vec!["imdb:tt0111161".to_string()])
+        );
     }
 
     fn sample_event(event_id: &str) -> DomainEvent {
@@ -3848,5 +4209,117 @@ mod file_delete_subscription_tests {
             .is_empty(),
             "a plain deletion must not reach a File Deleted for Upgrade subscriber"
         );
+    }
+
+    /// A file destroyed for good is still a file deletion, so it must reach File Deleted subscribers —
+    /// unless it was recycled because an upgrade replaced it, which is what that subscriber did not
+    /// ask about.
+    #[tokio::test]
+    async fn recycle_bin_purge_is_delivered_to_file_deleted_subscribers() {
+        assert_eq!(
+            dispatched_event_types(
+                NotificationEventType::FileDeleted,
+                MediaFileDeletedReason::RecycleBinPurged
+            )
+            .await,
+            vec![NotificationEventType::FileDeleted]
+        );
+
+        assert!(
+            dispatched_event_types(
+                NotificationEventType::FileDeletedForUpgrade,
+                MediaFileDeletedReason::RecycleBinPurged
+            )
+            .await
+            .is_empty(),
+            "a permanent purge is not an upgrade cleanup"
+        );
+
+        // A purge that removes the copy an upgrade replaced keeps that origin:
+        // someone subscribed to upgrade deletions wants to hear about it, and
+        // someone subscribed to plain deletions did not ask.
+        assert_eq!(
+            dispatched_event_types(
+                NotificationEventType::FileDeletedForUpgrade,
+                MediaFileDeletedReason::RecycleBinPurgedAfterUpgrade
+            )
+            .await,
+            vec![NotificationEventType::FileDeletedForUpgrade]
+        );
+
+        assert!(
+            dispatched_event_types(
+                NotificationEventType::FileDeleted,
+                MediaFileDeletedReason::RecycleBinPurgedAfterUpgrade
+            )
+            .await
+            .is_empty(),
+            "an upgrade-origin purge must not reach a plain File Deleted subscriber"
+        );
+    }
+
+    /// Every deletion reason must classify into a notification. A reason with no dispatch arm is
+    /// dropped silently, which is how the recycle bin purge went unannounced.
+    #[test]
+    fn every_media_file_deleted_reason_builds_a_notification() {
+        let cases = [
+            (
+                MediaFileDeletedReason::Deleted,
+                NotificationEventType::FileDeleted,
+                "File deleted: Harbor Lantern",
+                "Deleted media file from disk: ",
+            ),
+            (
+                MediaFileDeletedReason::MissingOnDisk,
+                NotificationEventType::FileDeleted,
+                "File deleted: Harbor Lantern",
+                "Deleted media file from disk: ",
+            ),
+            (
+                MediaFileDeletedReason::RecycleBinPurged,
+                NotificationEventType::FileDeleted,
+                "Recycle bin purged: Harbor Lantern",
+                "Permanently deleted recycled media file: ",
+            ),
+            (
+                MediaFileDeletedReason::RecycleBinPurgedAfterUpgrade,
+                NotificationEventType::FileDeletedForUpgrade,
+                "Deleted for upgrade: Harbor Lantern",
+                "Permanently deleted the recycled copy an upgrade had replaced: ",
+            ),
+            (
+                MediaFileDeletedReason::UpgradeCleanup,
+                NotificationEventType::FileDeletedForUpgrade,
+                "Deleted for upgrade: Harbor Lantern",
+                "Removed old media file during upgrade: ",
+            ),
+        ];
+
+        for (reason, expected_event_type, expected_title, expected_message_prefix) in cases {
+            let built = build_notification(&media_file_deleted_event("evt-fixture", reason))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "deletion reason '{}' built no notification",
+                        reason.as_str()
+                    )
+                });
+
+            assert_eq!(
+                built.payload.event_type,
+                expected_event_type,
+                "deletion reason '{}' classified as the wrong event type",
+                reason.as_str()
+            );
+            assert_eq!(built.payload.summary_title, expected_title);
+            assert!(
+                built
+                    .payload
+                    .summary_message
+                    .starts_with(expected_message_prefix),
+                "deletion reason '{}' produced '{}'",
+                reason.as_str(),
+                built.payload.summary_message
+            );
+        }
     }
 }

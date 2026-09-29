@@ -161,7 +161,11 @@ pub(crate) fn activity_event_from_domain_event(event: &DomainEvent) -> Option<Ac
         ),
         DomainEventPayload::MediaFileDeleted(data) => (
             ActivityKind::SystemNotice,
-            if matches!(data.reason, MediaFileDeletedReason::UpgradeCleanup) {
+            if matches!(
+                data.reason,
+                MediaFileDeletedReason::UpgradeCleanup
+                    | MediaFileDeletedReason::RecycleBinPurgedAfterUpgrade
+            ) {
                 ActivitySeverity::Info
             } else {
                 ActivitySeverity::Warning
@@ -174,6 +178,12 @@ pub(crate) fn activity_event_from_domain_event(event: &DomainEvent) -> Option<Ac
                     }
                     MediaFileDeletedReason::RecycleBinPurged => {
                         format!("Permanently deleted recycled media file: {}", update.path)
+                    }
+                    MediaFileDeletedReason::RecycleBinPurgedAfterUpgrade => {
+                        format!(
+                            "Permanently deleted the recycled copy an upgrade had replaced: {}",
+                            update.path
+                        )
                     }
                     MediaFileDeletedReason::Deleted | MediaFileDeletedReason::MissingOnDisk => {
                         format!("Deleted media file from disk: {}", update.path)
