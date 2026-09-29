@@ -10,13 +10,13 @@ use scryer_application::{
     INDEXER_CAPS_REFRESH_ERROR_PREFIX, IndexerClient, IndexerConfigRepository,
     IndexerErrorClassification, IndexerErrorOperation, IndexerErrorRepository,
     IndexerPluginProvider, IndexerQueryOutcome, IndexerResponseAttributes, IndexerRoutingPlan,
-    IndexerSearchCandidateWrite, IndexerSearchCompletion, IndexerSearchEligibility,
-    IndexerSearchIncompleteReason, IndexerSearchLearningContext, IndexerSearchLearningKey,
-    IndexerSearchLearningRecord, IndexerSearchLearningRepository, IndexerSearchNumberingContext,
-    IndexerSearchOutcome, IndexerSearchPageSink, IndexerSearchPlanRequest, IndexerSearchResponse,
-    IndexerSearchResult, IndexerSearchRunWrite, IndexerSearchStrategyEvent,
-    IndexerSearchStrategyEventSink, IndexerSearchStrategyRequest, IndexerStatsTracker,
-    IndexerSystemBackoff, NewIndexerError, NormalizedIndexerSearchCandidate,
+    IndexerRssCatchUp, IndexerSearchCandidateWrite, IndexerSearchCompletion,
+    IndexerSearchEligibility, IndexerSearchIncompleteReason, IndexerSearchLearningContext,
+    IndexerSearchLearningKey, IndexerSearchLearningRecord, IndexerSearchLearningRepository,
+    IndexerSearchNumberingContext, IndexerSearchOutcome, IndexerSearchPageSink,
+    IndexerSearchPlanRequest, IndexerSearchResponse, IndexerSearchResult, IndexerSearchRunWrite,
+    IndexerSearchStrategyEvent, IndexerSearchStrategyEventSink, IndexerSearchStrategyRequest,
+    IndexerStatsTracker, IndexerSystemBackoff, NewIndexerError, NormalizedIndexerSearchCandidate,
     NullIndexerErrorRepository, NullIndexerSearchLearningRepository, NullProxyConfigRepository,
     NullUpstreamScheduler, ProxyConfigRepository, RateLimitCooldownAction, RateLimitSignal,
     ReleaseCandidateProvenance, ReleaseSearchSubjectKind, ReusableIndexerSearchCandidate,
@@ -75,6 +75,20 @@ struct SchedulerRssActivity {
     estimated_feed_depth: Option<u32>,
     freshness_risk: Option<f64>,
     destination_recent_activity_at: Option<DateTime<Utc>>,
+    /// The newest release recorded on the previous successful poll.
+    last_seen_release_identity: Option<String>,
+    last_seen_release_published_at: Option<DateTime<Utc>>,
+}
+
+impl SchedulerRssActivity {
+    /// The marker a paging indexer reads back to. A marker without a publish
+    /// time cannot bound the read, so none is sent for it.
+    fn rss_catch_up(&self) -> Option<IndexerRssCatchUp> {
+        Some(IndexerRssCatchUp {
+            last_seen_published_at: self.last_seen_release_published_at?,
+            last_seen_identity: self.last_seen_release_identity.clone(),
+        })
+    }
 }
 
 struct SchedulerEligibleIndexer<'a> {
@@ -83,6 +97,7 @@ struct SchedulerEligibleIndexer<'a> {
     candidate_id: SchedulerCandidateId,
     category_request: Option<Vec<String>>,
     rss_request_key: Option<String>,
+    rss_catch_up: Option<IndexerRssCatchUp>,
 }
 
 #[derive(Debug)]
@@ -221,6 +236,8 @@ struct StrategyTierContext {
     /// strategy.
     year: Option<i32>,
     tagged_aliases: Vec<scryer_domain::TaggedAlias>,
+    /// Where this indexer's previous RSS poll stopped; `None` outside RSS.
+    rss_catch_up: Option<IndexerRssCatchUp>,
     cancel_token: CancellationToken,
     deadline_at: Option<tokio::time::Instant>,
 }
@@ -383,6 +400,7 @@ fn prepare_search_strategies(
             absolute_episode,
             year: context.year,
             tagged_aliases: context.tagged_aliases.clone(),
+            rss_catch_up: context.rss_catch_up.clone(),
         };
         by_identity.insert(strategy_id.clone(), prepared.len());
         prepared.push(PreparedSearchStrategy {
@@ -1539,7 +1557,7 @@ fn indexer_rss_feedback_summary(
         let Some(published_at) = result
             .published_at
             .as_deref()
-            .and_then(parse_indexer_published_at)
+            .and_then(scryer_application::parse_published_at)
         else {
             continue;
         };
@@ -1555,12 +1573,6 @@ fn indexer_rss_feedback_summary(
         Some(response.results.len().min(u32::MAX as usize) as u32),
         seen_identities,
     )
-}
-
-fn parse_indexer_published_at(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|value| value.with_timezone(&Utc))
 }
 
 /// Records transport metrics per outbound indexer request.
@@ -2888,6 +2900,23 @@ impl MultiIndexerSearchClient {
                     && entry.rss_request_key.as_deref() == rss_request_key
             })
             .fold(SchedulerRssActivity::default(), |activity, entry| {
+                // The marker comes from the entry holding the newest release, so
+                // identity and publish time always describe the same release.
+                let entry_is_newer = entry.rss_last_seen_release_published_at.is_some()
+                    && entry.rss_last_seen_release_published_at
+                        > activity.last_seen_release_published_at;
+                let (last_seen_release_identity, last_seen_release_published_at) = if entry_is_newer
+                {
+                    (
+                        entry.rss_last_seen_release_identity.clone(),
+                        entry.rss_last_seen_release_published_at,
+                    )
+                } else {
+                    (
+                        activity.last_seen_release_identity.clone(),
+                        activity.last_seen_release_published_at,
+                    )
+                };
                 SchedulerRssActivity {
                     last_successful_poll_at: activity.last_successful_poll_at.max(
                         entry
@@ -2908,6 +2937,8 @@ impl MultiIndexerSearchClient {
                     destination_recent_activity_at: activity
                         .destination_recent_activity_at
                         .max(entry.rss_destination_recent_activity_at),
+                    last_seen_release_identity,
+                    last_seen_release_published_at,
                 }
             })
     }
@@ -3518,6 +3549,7 @@ impl MultiIndexerSearchClient {
                     operation,
                     year: _,
                     tagged_aliases: _,
+                    rss_catch_up: _,
                     cancel_token,
                     deadline_at,
                 } = context;
@@ -3602,22 +3634,10 @@ impl MultiIndexerSearchClient {
                             async {
                                 request_fired = true;
                                 client
-                                    .search(
-                                        strategy.query,
-                                        strategy.ids,
-                                        strategy.category,
-                                        strategy.facet,
-                                        strategy.id_search_facet,
-                                        strategy.newznab_categories,
-                                        None,
+                                    .search_strategy(
+                                        strategy,
                                         mode,
                                         operation,
-                                        strategy.season,
-                                        strategy.episode,
-                                        strategy.absolute_episode,
-                                        strategy.year,
-                                        strategy.tagged_aliases,
-                                        None,
                                         request_cancel_token,
                                     )
                                     .await
@@ -4749,6 +4769,7 @@ impl IndexerClient for MultiIndexerSearchClient {
                     candidate_id: scheduler_candidate_id,
                     category_request,
                     rss_request_key,
+                    rss_catch_up: rss_activity.rss_catch_up(),
                 });
             }
         }
@@ -4818,6 +4839,7 @@ impl IndexerClient for MultiIndexerSearchClient {
             let had_persisted_system_backoff = dispatch.had_persisted_system_backoff;
             let request_categories = dispatch.category_request.clone();
             let rss_request_key = dispatch.rss_request_key.clone();
+            let rss_catch_up = dispatch.rss_catch_up.clone();
             let (scheduler_lease, scheduler_blocked_outcome, scheduler_retry_after) =
                 match scheduler_admission {
                     SchedulerAdmission::Admit { reason, lease, .. } => {
@@ -5064,6 +5086,7 @@ impl IndexerClient for MultiIndexerSearchClient {
                 let query = query.clone();
                 let category = category.clone();
                 let tagged_aliases = tagged_aliases.clone();
+                let rss_catch_up = rss_catch_up.clone();
                 let indexer_id = config.id.clone();
                 let indexer_name = config.name.clone();
                 let rate_limiter = self.rate_limiter.clone();
@@ -5168,24 +5191,28 @@ impl IndexerClient for MultiIndexerSearchClient {
                                 let request_cancel_token = task_cancel_token.child_token();
                                 let request_deadline =
                                     effective_request_deadline(search_timeout, deadline_at);
+                                let rss_strategy = IndexerSearchStrategyRequest {
+                                    strategy_id: String::new(),
+                                    labels: Vec::new(),
+                                    query,
+                                    ids: HashMap::new(),
+                                    category,
+                                    facet: Some(facet),
+                                    id_search_facet: None,
+                                    newznab_categories: rss_category_request.clone(),
+                                    season,
+                                    episode,
+                                    absolute_episode,
+                                    // An RSS poll has no subject, so no year.
+                                    year: None,
+                                    tagged_aliases,
+                                    rss_catch_up,
+                                };
                                 let search_response = within_search_window(
-                                    client.search(
-                                        query,
-                                        HashMap::new(),
-                                        category,
-                                        Some(facet),
-                                        None,
-                                        rss_category_request.clone(),
-                                        None,
+                                    client.search_strategy(
+                                        rss_strategy,
                                         mode,
                                         IndexerErrorOperation::RssSync,
-                                        season,
-                                        episode,
-                                        absolute_episode,
-                                        // An RSS poll has no subject, so no year.
-                                        None,
-                                        tagged_aliases,
-                                        None,
                                         request_cancel_token,
                                     ),
                                     &task_cancel_token,
@@ -5580,6 +5607,7 @@ impl IndexerClient for MultiIndexerSearchClient {
                         operation,
                         year,
                         tagged_aliases: tagged_aliases_for_indexer.clone(),
+                        rss_catch_up: rss_catch_up.clone(),
                         cancel_token: task_cancel_token.child_token(),
                         deadline_at,
                     };
@@ -5931,6 +5959,7 @@ impl IndexerClient for MultiIndexerSearchClient {
                             operation,
                             year,
                             tagged_aliases: tagged_aliases_for_indexer.clone(),
+                            rss_catch_up: rss_catch_up.clone(),
                             cancel_token: task_cancel_token.child_token(),
                             deadline_at,
                         };
@@ -7550,6 +7579,7 @@ mod tests {
             operation: IndexerErrorOperation::AutomaticSearch,
             year: None,
             tagged_aliases: Vec::new(),
+            rss_catch_up: None,
             cancel_token: CancellationToken::new(),
             deadline_at: None,
         };
@@ -9044,6 +9074,7 @@ mod tests {
                 absolute_episode: None,
                 year: None,
                 tagged_aliases: Vec::new(),
+                rss_catch_up: None,
             },
             title_guard_mode: TitleGuardMode::SkipTitleMatch,
         }
@@ -9071,6 +9102,7 @@ mod tests {
                 operation: IndexerErrorOperation::AutomaticSearch,
                 year: None,
                 tagged_aliases: Vec::new(),
+                rss_catch_up: None,
                 cancel_token: CancellationToken::new(),
                 deadline_at: None,
             },
@@ -9101,6 +9133,7 @@ mod tests {
             operation: IndexerErrorOperation::InteractiveSearch,
             year,
             tagged_aliases: Vec::new(),
+            rss_catch_up: None,
             cancel_token: CancellationToken::new(),
             deadline_at: None,
         }
@@ -12786,6 +12819,7 @@ mod tests {
             operation: IndexerErrorOperation::AutomaticSearch,
             year: None,
             tagged_aliases: Vec::new(),
+            rss_catch_up: None,
             cancel_token,
             deadline_at,
         }
