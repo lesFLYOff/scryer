@@ -171,11 +171,19 @@ pub async fn extract_archives_if_needed(
         )));
     };
 
+    let split_set = sets
+        .iter()
+        .map(|(path, _)| path.clone())
+        .find(|path| is_split_set_first_volume(path));
     let extraction =
         extract_into_workspace(&workspace, sets, is_sample, passwords, &provider).await;
 
     match extraction {
         Ok(true) => Ok(Some(workspace_root)),
+        Ok(false) if let Some(split_set) = split_set => {
+            cleanup_extracted_dir(&workspace_root).await;
+            Err(split_set_extraction_error(&split_set, None))
+        }
         Ok(false) => {
             info!("archive extracted but no video files found in output");
             cleanup_extracted_dir(&workspace_root).await;
@@ -288,6 +296,27 @@ fn nested_archive_sets(
         .collect()
 }
 
+/// The error for a split set the plugin could not turn into video. Published
+/// plugin versions cannot join split volumes, and the plain failure they give
+/// (or an empty output) would read as a broken download; this names the real
+/// remedy while keeping the plugin's own words.
+fn split_set_extraction_error(first_volume: &Path, detail: Option<String>) -> AppError {
+    let name = first_volume
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut message = format!(
+        "This import is blocked because {name} is the first volume of a split archive set that the Archive Extraction plugin could not extract into video. Versions of the plugin that cannot join split volumes fail this way: update the Archive Extraction plugin, then re-import."
+    );
+    if let Some(detail) = detail {
+        message.push_str(&format!(" Plugin result: {detail}"));
+    }
+    AppError::ArchiveExtractionPluginRequired {
+        message,
+        source_path: Some(first_volume.to_string_lossy().into_owned()),
+    }
+}
+
 /// One archive set extracted into its own output directory of the workspace.
 struct ArchiveSetExtraction<'a> {
     workspace: &'a ArchiveExtractionWorkspace,
@@ -300,6 +329,24 @@ struct ArchiveSetExtraction<'a> {
 
 impl ArchiveSetExtraction<'_> {
     async fn extract(&self, totals: &mut PluginOutputTotals) -> AppResult<()> {
+        let result = self.extract_with_candidates(totals).await;
+        match result {
+            Err(error)
+                if is_split_set_first_volume(self.archive_path)
+                    && !is_timeout_error(&error)
+                    && !is_password_required_error(&error)
+                    && !matches!(error, AppError::ArchiveExtractionPluginRequired { .. }) =>
+            {
+                Err(split_set_extraction_error(
+                    self.archive_path,
+                    Some(error.to_string()),
+                ))
+            }
+            result => result,
+        }
+    }
+
+    async fn extract_with_candidates(&self, totals: &mut PluginOutputTotals) -> AppResult<()> {
         let mut rejection = match self.attempt(None, totals).await? {
             ArchiveAttempt::Extracted => return Ok(()),
             ArchiveAttempt::PasswordRejected(error) => error,
@@ -1028,6 +1075,9 @@ fn archive_sets_in_dir(dir: &Path) -> Vec<(PathBuf, ArchiveType)> {
     paths.into_iter().map(|path| (path, archive_type)).collect()
 }
 
+/// The archive type a file starts a set of, when it does. Split volumes
+/// (`.7z.001`, `.zip.001`, bare `.001`) start a set only at volume `001`; the
+/// plugin is handed that first volume and joins its siblings itself.
 fn archive_type_for_path(path: &Path) -> Option<ArchiveType> {
     match path
         .extension()
@@ -1038,8 +1088,45 @@ fn archive_type_for_path(path: &Path) -> Option<ArchiveType> {
         "rar" => Some(ArchiveType::Rar),
         "7z" => Some(ArchiveType::SevenZip),
         "zip" => Some(ArchiveType::Zip),
+        "001" => split_set_archive_type(path),
         _ => None,
     }
+}
+
+/// The inner format of a split set's first volume: named by the extension
+/// before `.001`, or for a bare `.001` read from the volume's signature, so a
+/// split video or a split RAR set is not taken for one.
+fn split_set_archive_type(first_volume: &Path) -> Option<ArchiveType> {
+    const SEVEN_ZIP_SIGNATURE: &[u8] = b"7z\xbc\xaf\x27\x1c";
+    const ZIP_SIGNATURE: &[u8] = b"PK\x03\x04";
+
+    let stem = Path::new(first_volume.file_stem()?);
+    match stem
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("7z") => return Some(ArchiveType::SevenZip),
+        Some("zip") => return Some(ArchiveType::Zip),
+        _ => {}
+    }
+    let mut signature = [0u8; 6];
+    let mut file = std::fs::File::open(first_volume).ok()?;
+    std::io::Read::read_exact(&mut file, &mut signature).ok()?;
+    if signature.starts_with(SEVEN_ZIP_SIGNATURE) {
+        Some(ArchiveType::SevenZip)
+    } else if signature.starts_with(ZIP_SIGNATURE) {
+        Some(ArchiveType::Zip)
+    } else {
+        None
+    }
+}
+
+fn is_split_set_first_volume(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension == "001")
 }
 
 fn rar_selection_key(path: &Path) -> (String, usize, String) {
@@ -2966,5 +3053,161 @@ mod tests {
         );
         assert!(!parent.path().join("out").exists());
         assert!(workspace.join("out/leftover.mkv").is_file());
+    }
+    #[test]
+    fn only_the_first_volume_of_a_split_set_starts_an_archive_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            path
+        };
+        let named_7z = write("quiet.harbor.7z.001", b"not sniffed");
+        let named_zip = write("quiet.harbor.ZIP.001", b"not sniffed");
+        let later_volume = write("quiet.harbor.7z.002", b"7z\xbc\xaf\x27\x1c\x00\x04");
+        let bare_7z = write("quiet.harbor.a.001", b"7z\xbc\xaf\x27\x1c\x00\x04");
+        let bare_zip = write("quiet.harbor.b.001", b"PK\x03\x04\x14\x00");
+        let split_video = write("quiet.harbor.mkv.001", b"\x1a\x45\xdf\xa3\x01\x00");
+        let split_rar = write("quiet.harbor.c.001", b"Rar!\x1a\x07\x01\x00");
+        let short = write("quiet.harbor.d.001", b"7z");
+
+        let kind = |path: &Path| archive_type_for_path(path).map(ArchiveType::as_str);
+        assert_eq!(kind(&named_7z), Some("7z"));
+        assert_eq!(kind(&named_zip), Some("zip"));
+        assert_eq!(kind(&bare_7z), Some("7z"));
+        assert_eq!(kind(&bare_zip), Some("zip"));
+        assert_eq!(kind(&later_volume), None);
+        assert_eq!(kind(&split_video), None);
+        assert_eq!(kind(&split_rar), None);
+        assert_eq!(kind(&short), None);
+    }
+
+    #[test]
+    fn a_split_set_is_discovered_by_its_first_volume_only() {
+        let dir = tempfile::tempdir().unwrap();
+        for volume in ["001", "002", "003"] {
+            fs::write(
+                dir.path().join(format!("quiet.harbor.s01.7z.{volume}")),
+                b"7z",
+            )
+            .unwrap();
+        }
+
+        let sets = find_archive_sets(dir.path());
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].0, dir.path().join("quiet.harbor.s01.7z.001"));
+        assert!(matches!(sets[0].1, ArchiveType::SevenZip));
+    }
+
+    #[tokio::test]
+    async fn a_split_set_is_handed_to_the_plugin_as_its_first_volume_and_inner_format() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        for volume in ["001", "002"] {
+            fs::write(
+                source.path().join(format!("quiet.harbor.zip.{volume}")),
+                b"zip",
+            )
+            .unwrap();
+        }
+        let operation = Arc::new(Mutex::new(None));
+        let client: Arc<dyn ArchiveExtractorClient> = Arc::new(RecordingArchiveClient {
+            operation: Arc::clone(&operation),
+            write_output_file: true,
+        });
+        let provider: Arc<dyn ArchiveExtractorPluginProvider> =
+            Arc::new(RecordingArchiveProvider {
+                client,
+                formats: vec![ArchivePluginFormat::Zip],
+            });
+
+        let extracted = extract_archives_if_needed(
+            source.path(),
+            is_sample_named_file,
+            Some(ArchiveExtractionDestination::new(
+                destination.path(),
+                "split",
+            )),
+            &ArchivePasswordCandidates::default(),
+            Some(provider),
+        )
+        .await
+        .unwrap()
+        .expect("video extracted");
+
+        assert!(extracted.join("out/movie.mkv").is_file());
+        let Some(ArchivePluginOperation::ExtractArchive {
+            archive_path,
+            format,
+            ..
+        }) = operation.lock().unwrap().clone()
+        else {
+            panic!("expected an extract operation");
+        };
+        assert_eq!(
+            PathBuf::from(archive_path),
+            source.path().join("quiet.harbor.zip.001")
+        );
+        assert_eq!(format, ArchivePluginFormat::Zip);
+    }
+
+    #[tokio::test]
+    async fn a_plugin_that_cannot_join_split_volumes_is_named_as_the_cause() {
+        let run = run_tree(
+            &["quiet.harbor.7z.001", "quiet.harbor.7z.002"],
+            vec![("quiet.harbor.7z.001", TreeStep::Fails)],
+            &ArchivePasswordCandidates::default(),
+        )
+        .await;
+
+        let error = run.result.as_ref().unwrap_err();
+        assert!(
+            matches!(error, AppError::ArchiveExtractionPluginRequired { .. }),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("quiet.harbor.7z.001"), "{message}");
+        assert!(message.contains("split archive set"), "{message}");
+        assert!(message.contains("corrupt_archive"), "{message}");
+        assert!(!is_password_required_error(error), "{message}");
+        assert!(run.staging_dirs().is_empty());
+        run.assert_unrelated_files_preserved(&["quiet.harbor.7z.001", "quiet.harbor.7z.002"]);
+    }
+
+    #[tokio::test]
+    async fn a_split_set_that_yields_no_video_is_not_reported_as_an_empty_download() {
+        let run = run_tree(
+            &["quiet.harbor.7z.001", "quiet.harbor.7z.002"],
+            vec![(
+                "quiet.harbor.7z.001",
+                TreeStep::Emits(vec![("readme.txt", b"txt")]),
+            )],
+            &ArchivePasswordCandidates::default(),
+        )
+        .await;
+
+        let error = run.result.as_ref().unwrap_err();
+        assert!(
+            matches!(error, AppError::ArchiveExtractionPluginRequired { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("split archive set"), "{error}");
+        assert!(run.staging_dirs().is_empty());
+        run.assert_unrelated_files_preserved(&["quiet.harbor.7z.001", "quiet.harbor.7z.002"]);
+    }
+
+    #[tokio::test]
+    async fn a_failing_unsplit_set_is_reported_as_itself() {
+        let run = run_tree(
+            &["quiet.harbor.7z"],
+            vec![("quiet.harbor.7z", TreeStep::Fails)],
+            &ArchivePasswordCandidates::default(),
+        )
+        .await;
+
+        let error = run.result.as_ref().unwrap_err();
+        assert!(matches!(error, AppError::Repository(_)), "{error:?}");
+        assert!(!error.to_string().contains("split"), "{error}");
+        assert!(run.staging_dirs().is_empty());
     }
 }
