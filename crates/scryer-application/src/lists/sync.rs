@@ -389,6 +389,13 @@ pub async fn sync_subscription(
                 if outcome.request_id.is_some() {
                     row.request_id = outcome.request_id;
                 }
+                // The action is done; record what it did before acting on the
+                // next item, so a sync cut short keeps `added_by_list` and
+                // the title and request it names.
+                context
+                    .memberships
+                    .upsert_many(std::slice::from_ref(&row))
+                    .await?;
             }
         }
         rows.push(row);

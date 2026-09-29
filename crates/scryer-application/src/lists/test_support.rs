@@ -157,6 +157,9 @@ pub(crate) struct MemoryListStore {
     /// Sync outcomes for these subscription ids cannot be saved, so they stay
     /// due.
     pub fail_record_sync_for: Mutex<HashSet<String>>,
+    /// When set, this many subscription reads by id succeed and every later
+    /// one fails, as a store that breaks partway through a sync would.
+    pub subscription_reads_left: Mutex<Option<usize>>,
 }
 
 impl MemoryListStore {
@@ -219,6 +222,12 @@ impl ListSubscriptionRepository for MemoryListStore {
     }
 
     async fn get_by_id(&self, id: &str) -> AppResult<Option<ListSubscription>> {
+        if let Some(left) = self.subscription_reads_left.lock().unwrap().as_mut() {
+            if *left == 0 {
+                return Err(AppError::Repository("fixture store failure".into()));
+            }
+            *left -= 1;
+        }
         Ok(self
             .subscriptions
             .lock()

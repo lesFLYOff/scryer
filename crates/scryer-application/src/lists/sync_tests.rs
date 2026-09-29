@@ -1244,3 +1244,19 @@ async fn a_list_unfollowed_while_it_syncs_takes_no_action() {
     assert!(harness.actions.calls().is_empty());
     assert!(harness.store.rows("list-a").is_empty());
 }
+
+#[tokio::test]
+async fn an_add_is_recorded_even_when_the_sync_breaks_off_after_it() {
+    let harness = Harness::new(vec![subscription("list-a")]);
+    harness.lists.serve("list-a", &["alpha", "beta"]);
+    // The store breaks after the check made before alpha's add.
+    *harness.store.subscription_reads_left.lock().unwrap() = Some(1);
+
+    let report = harness.sync_at(at(0)).await;
+
+    assert_eq!(report.failed, 1);
+    let row = harness.store.row("list-a", "alpha");
+    assert_eq!(row.state, ListMembershipState::Added);
+    assert!(row.added_by_list, "the list's add is remembered");
+    assert_eq!(row.title_id.as_deref(), Some("title-alpha"));
+}
