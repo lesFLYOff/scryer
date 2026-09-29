@@ -564,9 +564,9 @@ async fn a_season_only_title_search_asks_indexers_for_the_season_and_no_episode(
 async fn a_season_only_title_search_lists_only_multi_episode_releases_of_that_season() {
     let kept = [
         "Glass.Harbor.S02.1080p.WEB-DL-QUILLFOX",
-        // Another group: cross-indexer dedup keys a season pack by group,
-        // quality and season, not by part, and would fold the two together.
-        "Glass.Harbor.S02.Part.1.720p.WEB-DL-DRIFTWOOD",
+        // Same group and quality as the full pack: a part of the season is
+        // its own release and must not fold into it as a duplicate.
+        "Glass.Harbor.S02.Part.1.1080p.WEB-DL-QUILLFOX",
         "Glass.Harbor.S02E01E02.1080p.WEB-DL-QUILLFOX",
         "Glass.Harbor.S01-S03.1080p.BluRay.x264-QUILLFOX",
     ];
