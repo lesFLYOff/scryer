@@ -90,11 +90,16 @@ impl ArchiveType {
     }
 }
 
-/// If the download directory contains no video files but has archive files,
-/// extract them to a hidden destination-side staging directory and return the path.
-/// Returns `None` if no extraction was needed (video files exist directly).
+/// If the download directory contains no importable video files but has
+/// archive files, extract them to a hidden destination-side staging directory
+/// and return the path. Returns `None` if no extraction was needed (importable
+/// video files exist directly).
+///
+/// `is_sample` is the sample rule the import scan will apply afterwards: a
+/// video it would discard does not make the download's archives redundant.
 pub async fn extract_archives_if_needed(
     dir: &Path,
+    is_sample: fn(&Path) -> bool,
     destination: Option<ArchiveExtractionDestination>,
     password: Option<&str>,
     archive_provider: Option<Arc<dyn ArchiveExtractorPluginProvider>>,
@@ -103,7 +108,7 @@ pub async fn extract_archives_if_needed(
     let password = password.map(|s| s.to_string());
     let archive = {
         let dir = dir.clone();
-        tokio::task::spawn_blocking(move || plan_archive_extraction(&dir))
+        tokio::task::spawn_blocking(move || plan_archive_extraction(&dir, is_sample))
             .await
             .map_err(|e| AppError::Repository(format!("archive detection task failed: {e}")))??
     };
@@ -166,8 +171,11 @@ pub async fn extract_archives_if_needed(
     }
 }
 
-pub fn archive_extraction_would_be_needed(dir: &Path) -> AppResult<bool> {
-    Ok(plan_archive_extraction(dir)?.is_some())
+pub fn archive_extraction_would_be_needed(
+    dir: &Path,
+    is_sample: fn(&Path) -> bool,
+) -> AppResult<bool> {
+    Ok(plan_archive_extraction(dir, is_sample)?.is_some())
 }
 
 /// Check if an extraction error indicates a password-protected archive.
@@ -180,13 +188,17 @@ pub fn is_timeout_error(error: &AppError) -> bool {
     matches!(error, AppError::ArchiveExtractionTimedOut { .. })
 }
 
-fn plan_archive_extraction(dir: &Path) -> AppResult<Option<(PathBuf, ArchiveType)>> {
+fn plan_archive_extraction(
+    dir: &Path,
+    is_sample: fn(&Path) -> bool,
+) -> AppResult<Option<(PathBuf, ArchiveType)>> {
     if dir.is_file() {
         return Ok(archive_type_for_path(dir).map(|archive_type| (dir.to_path_buf(), archive_type)));
     }
 
-    // If video files already exist, no extraction needed.
-    if has_video_files(dir) {
+    // If importable video files already exist, no extraction needed. A release
+    // whose only loose video is its sample still needs its archives.
+    if has_importable_video_files(dir, is_sample) {
         return Ok(None);
     }
 
@@ -595,6 +607,24 @@ fn has_video_files(dir: &Path) -> bool {
     false
 }
 
+/// Like `has_video_files`, but a video the import scan would discard as a
+/// sample does not count.
+fn has_importable_video_files(dir: &Path, is_sample: fn(&Path) -> bool) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && scryer_domain::is_video_file(&path) && !is_sample(&path) {
+            return true;
+        }
+        if path.is_dir() && has_importable_video_files(&path, is_sample) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Find the primary archive file in a directory. Prefers RAR, then 7z, then zip.
 fn find_primary_archive(dir: &Path) -> Option<(PathBuf, ArchiveType)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -704,6 +734,7 @@ fn is_archive_write_probe_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::import::workflow::{is_sample_file, is_sample_named_file};
     use crate::{ArchiveExtractorClient, ArchiveExtractorPluginProvider};
     use scryer_plugin_sdk::ArchivePluginExtractedFile;
     use std::fs;
@@ -898,9 +929,10 @@ mod tests {
             let archive_path = dir.path().join(file_name);
             fs::write(&archive_path, b"archive").unwrap();
 
-            let (planned_path, archive_type) = plan_archive_extraction(&archive_path)
-                .unwrap()
-                .expect("direct archive file should require extraction");
+            let (planned_path, archive_type) =
+                plan_archive_extraction(&archive_path, is_sample_named_file)
+                    .unwrap()
+                    .expect("direct archive file should require extraction");
 
             assert_eq!(planned_path, archive_path);
             assert_eq!(archive_type.as_str(), expected_type);
@@ -920,6 +952,142 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("movie.mkv"), b"video").unwrap();
         assert!(find_primary_archive(dir.path()).is_none());
+    }
+
+    /// A scene-style release folder: an old-style RAR set, its nfo/sfv, and a
+    /// `Sample/` directory holding the only loose video, named as a sample.
+    fn scene_rar_release_with_sample(root: &Path) -> PathBuf {
+        let release = root.join("Quiet.Harbor.S06E07.1080p.WEB.H264-NOGRP");
+        fs::create_dir(&release).unwrap();
+        let stem = "quiet.harbor.s06e07.1080p.web.h264-nogrp";
+        fs::write(release.join(format!("{stem}.rar")), b"rar").unwrap();
+        for volume in 0..=8 {
+            fs::write(release.join(format!("{stem}.r{volume:02}")), b"rar").unwrap();
+        }
+        fs::write(release.join(format!("{stem}.nfo")), b"nfo").unwrap();
+        fs::write(release.join(format!("{stem}.sfv")), b"sfv").unwrap();
+        let sample = release.join("Sample");
+        fs::create_dir(&sample).unwrap();
+        fs::write(sample.join(format!("{stem}-sample.mkv")), b"sample video").unwrap();
+        release
+    }
+
+    /// A sparse video comfortably above the series sample-size threshold.
+    fn write_full_size_video(path: &Path) {
+        fs::File::create(path)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+    }
+
+    #[test]
+    fn sample_only_series_release_still_plans_extraction() {
+        let root = tempfile::tempdir().unwrap();
+        let release = scene_rar_release_with_sample(root.path());
+
+        let (archive, kind) = plan_archive_extraction(&release, is_sample_file)
+            .unwrap()
+            .expect("a series release whose only video is its sample needs its archives");
+
+        assert!(matches!(kind, ArchiveType::Rar));
+        assert_eq!(
+            archive.file_name().and_then(|name| name.to_str()),
+            Some("quiet.harbor.s06e07.1080p.web.h264-nogrp.rar")
+        );
+        assert!(archive_extraction_would_be_needed(&release, is_sample_file).unwrap());
+    }
+
+    #[test]
+    fn sample_only_movie_release_still_plans_extraction() {
+        let root = tempfile::tempdir().unwrap();
+        let release = scene_rar_release_with_sample(root.path());
+
+        assert!(archive_extraction_would_be_needed(&release, is_sample_named_file).unwrap());
+    }
+
+    #[test]
+    fn real_video_beside_archives_skips_extraction_for_every_rule() {
+        let root = tempfile::tempdir().unwrap();
+        let release = scene_rar_release_with_sample(root.path());
+        write_full_size_video(&release.join("quiet.harbor.s06e07.1080p.web.h264-nogrp.mkv"));
+
+        assert!(!archive_extraction_would_be_needed(&release, is_sample_file).unwrap());
+        assert!(!archive_extraction_would_be_needed(&release, is_sample_named_file).unwrap());
+    }
+
+    #[test]
+    fn small_unnamed_movie_beside_archives_is_not_treated_as_a_sample() {
+        let root = tempfile::tempdir().unwrap();
+        let release = root.path().join("Tiny.Reel.1931.480p");
+        fs::create_dir(&release).unwrap();
+        fs::write(release.join("tiny.reel.1931.480p.rar"), b"rar").unwrap();
+        fs::write(release.join("tiny.reel.1931.480p.mkv"), b"short film").unwrap();
+
+        assert!(!archive_extraction_would_be_needed(&release, is_sample_named_file).unwrap());
+    }
+
+    #[test]
+    fn sample_only_release_without_archives_plans_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let release = root.path().join("Quiet.Harbor.S06E07.1080p.WEB.H264-NOGRP");
+        let sample = release.join("Sample");
+        fs::create_dir_all(&sample).unwrap();
+        fs::write(sample.join("quiet.harbor.s06e07-sample.mkv"), b"sample").unwrap();
+
+        assert!(
+            plan_archive_extraction(&release, is_sample_file)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            plan_archive_extraction(&release, is_sample_named_file)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The import scans the staging workspace it gets back, never the torrent
+    /// folder, so the sample left beside the archives cannot become the movie.
+    #[tokio::test]
+    async fn sample_only_release_extracts_and_the_scan_sees_only_extracted_video() {
+        let root = tempfile::tempdir().unwrap();
+        let release = scene_rar_release_with_sample(root.path());
+        let destination = tempfile::tempdir().unwrap();
+        let provider = scripted_provider(ScriptedArchiveClient {
+            emitted: vec![("quiet.harbor.s06e07.1080p.web.h264-nogrp.mkv", b"video")],
+            status: ArchivePluginStatus::Ok,
+            error_code: None,
+            message: None,
+            copied_bytes: None,
+        });
+
+        let extracted = extract_archives_if_needed(
+            &release,
+            is_sample_named_file,
+            Some(ArchiveExtractionDestination::new(
+                destination.path(),
+                "sample-only-release",
+            )),
+            None,
+            Some(provider),
+        )
+        .await
+        .unwrap()
+        .expect("the archives must be extracted");
+
+        let scanned = crate::import::workflow::find_video_files(&extracted, false).unwrap();
+        assert_eq!(scanned.len(), 1, "{scanned:?}");
+        assert_eq!(
+            scanned[0].file_name().and_then(|name| name.to_str()),
+            Some("quiet.harbor.s06e07.1080p.web.h264-nogrp.mkv")
+        );
+        assert!(scanned[0].starts_with(destination.path()));
+        assert!(
+            release
+                .join("Sample")
+                .join("quiet.harbor.s06e07.1080p.web.h264-nogrp-sample.mkv")
+                .exists()
+        );
     }
 
     #[test]
@@ -942,7 +1110,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("movie.mkv"), b"video").unwrap();
         fs::write(dir.path().join("archive.rar"), b"rar").unwrap();
-        let result = extract_archives_if_needed(dir.path(), None, None, None)
+        let result = extract_archives_if_needed(dir.path(), is_sample_named_file, None, None, None)
             .await
             .unwrap();
         assert!(result.is_none());
@@ -956,6 +1124,7 @@ mod tests {
 
         let err = extract_archives_if_needed(
             dir.path(),
+            is_sample_named_file,
             Some(ArchiveExtractionDestination::new(
                 destination.path(),
                 "rar-plugin-required",
@@ -979,6 +1148,7 @@ mod tests {
 
         let err = extract_archives_if_needed(
             dir.path(),
+            is_sample_named_file,
             Some(ArchiveExtractionDestination::new(
                 destination.path(),
                 "7z-plugin-required",
@@ -1012,6 +1182,7 @@ mod tests {
 
         let err = extract_archives_if_needed(
             dir.path(),
+            is_sample_named_file,
             Some(ArchiveExtractionDestination::new(
                 destination.path(),
                 "7z-provider-missing-format",
@@ -1052,6 +1223,7 @@ mod tests {
 
         let result = extract_archives_if_needed(
             &archive_path,
+            is_sample_named_file,
             Some(ArchiveExtractionDestination::new(
                 destination.path(),
                 "7z-plain-extract",
@@ -1104,6 +1276,7 @@ mod tests {
 
         let result = extract_archives_if_needed(
             dir.path(),
+            is_sample_named_file,
             Some(ArchiveExtractionDestination::new(
                 destination.path(),
                 "zip-plain-extract",
@@ -1144,7 +1317,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("release.rar"), b"rar").unwrap();
 
-        let error = extract_archives_if_needed(dir.path(), None, None, None)
+        let error = extract_archives_if_needed(dir.path(), is_sample_named_file, None, None, None)
             .await
             .unwrap_err();
         assert!(
@@ -1174,6 +1347,7 @@ mod tests {
 
         let extracted = extract_archives_if_needed(
             &archive_path,
+            is_sample_named_file,
             Some(ArchiveExtractionDestination::new(
                 destination.path(),
                 "import/with spaces",
@@ -1315,6 +1489,7 @@ mod tests {
 
         let extracted = extract_archives_if_needed(
             source.path(),
+            is_sample_named_file,
             Some(ArchiveExtractionDestination::new(
                 destination.path(),
                 "par2-plain-files",
@@ -1358,6 +1533,7 @@ mod tests {
 
         let error = extract_archives_if_needed(
             source.path(),
+            is_sample_named_file,
             Some(ArchiveExtractionDestination::new(
                 destination.path(),
                 "par2-insufficient",

@@ -364,8 +364,32 @@ fn media_facet_from_archive_hint(value: &str) -> Option<MediaFacet> {
     }
 }
 
-fn archive_extraction_would_be_needed_best_effort(dir: &Path) -> bool {
-    match crate::archive_extractor::archive_extraction_would_be_needed(dir) {
+/// The sample rule the automatic import scan applies to a facet's download,
+/// which archive planning must share: series and anime drop sample-named and
+/// sample-sized videos, while the movie scan has no size heuristic, so only a
+/// sample-named video leaves a movie download still needing its archives.
+fn automatic_scan_sample_rule(facet: &MediaFacet) -> fn(&Path) -> bool {
+    if matches!(facet, MediaFacet::Series | MediaFacet::Anime) {
+        is_sample_file
+    } else {
+        is_sample_named_file
+    }
+}
+
+/// The sample rule for a download whose title is not known yet: the facet
+/// hint the titleless archive probe itself uses, else the name-only rule every
+/// facet agrees on.
+fn titleless_sample_rule(completed: &CompletedDownload) -> fn(&Path) -> bool {
+    archive_probe_facet_from_completed(completed)
+        .map(|facet| automatic_scan_sample_rule(&facet))
+        .unwrap_or(is_sample_named_file)
+}
+
+fn archive_extraction_would_be_needed_best_effort(
+    dir: &Path,
+    is_sample: fn(&Path) -> bool,
+) -> bool {
+    match crate::archive_extractor::archive_extraction_would_be_needed(dir, is_sample) {
         Ok(needed) => needed,
         Err(error) => {
             tracing::warn!(
@@ -396,7 +420,8 @@ async fn try_match_titleless_archive_from_inner_video(
     archive_password: Option<&str>,
     resolved_title_authorization: Option<&User>,
 ) -> AppResult<Option<TitlelessArchiveMatch>> {
-    if !archive_extraction_would_be_needed_best_effort(dest_dir) {
+    let is_sample = titleless_sample_rule(completed);
+    if !archive_extraction_would_be_needed_best_effort(dest_dir, is_sample) {
         return Ok(None);
     }
     let Some((destination, facet)) =
@@ -422,6 +447,7 @@ async fn try_match_titleless_archive_from_inner_video(
             .await;
         crate::archive_extractor::extract_archives_if_needed(
             dest_dir,
+            is_sample,
             Some(destination),
             archive_password,
             archive_provider.clone(),
@@ -490,6 +516,7 @@ async fn try_match_titleless_archive_from_inner_video(
                             .await;
                         crate::archive_extractor::extract_archives_if_needed(
                             dest_dir,
+                            is_sample,
                             Some(destination),
                             archive_password,
                             archive_provider.clone(),
@@ -650,7 +677,10 @@ async fn resolve_completed_import_target(
     let title = match title {
         Some(t) => t,
         None => {
-            let archive_message = if archive_extraction_would_be_needed_best_effort(dest_dir) {
+            let archive_message = if archive_extraction_would_be_needed_best_effort(
+                dest_dir,
+                titleless_sample_rule(completed),
+            ) {
                 "; archived downloads require a facet/category hint and configured library root before Scryer can stage extraction under the import destination"
             } else {
                 ""
@@ -703,7 +733,10 @@ async fn resolve_completed_import_target(
     // 3. FIND VIDEO FILES (extract archives first if needed)
     let is_series = matches!(title.facet, MediaFacet::Series | MediaFacet::Anime);
     if extracted_dir.is_none() {
-        let extraction_destination = if archive_extraction_would_be_needed_best_effort(dest_dir) {
+        let extraction_destination = if archive_extraction_would_be_needed_best_effort(
+            dest_dir,
+            automatic_scan_sample_rule(&title.facet),
+        ) {
             Some(archive_extraction_destination_for_title(app, import_id, &title).await?)
         } else {
             None
@@ -741,6 +774,7 @@ async fn resolve_completed_import_target(
             }
             crate::archive_extractor::extract_archives_if_needed(
                 dest_dir,
+                automatic_scan_sample_rule(&title.facet),
                 extraction_destination,
                 archive_password,
                 app.services
