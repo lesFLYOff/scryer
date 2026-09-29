@@ -13,6 +13,7 @@ import {
   seriesCollectionEpisodesQuery,
   movieEntityDetailQuery,
   seriesSidePanelOverviewQuery,
+  titleMediaFilesQuery,
 } from "@/lib/graphql/queries";
 import {
   addListExclusionMutation,
@@ -38,7 +39,7 @@ import {
 } from "@/lib/graphql/release-search";
 import { isAbortError } from "@/lib/graphql/urql-client";
 import {
-  queueScopeReplacesPrimary,
+  queueScopeReplacesPrimaryFromTitleFiles,
   releaseQueueScopeInput,
 } from "@/lib/utils/release-queue-scope";
 import {
@@ -1917,10 +1918,35 @@ export const SeriesOverviewContainer = React.memo(function SeriesOverviewContain
           scope: releaseQueueScopeInput(release, { collection: collection.id }),
           candidateToken: release.candidateToken,
         };
-        const replacesPrimary = queueScopeReplacesPrimary(
+        // A season's files are loaded episode by episode as panels open, so
+        // the cache cannot say whether the season holds a primary file. Read
+        // the title's files, and the season's episodes if they are not
+        // loaded yet, before choosing the replacement path.
+        const { data: filesData, error: filesError } = await client
+          .query(titleMediaFilesQuery, { id: title.id }, { requestPolicy: "network-only" })
+          .toPromise();
+        if (filesError) throw filesError;
+        let scopeEpisodes: Record<string, readonly { id: string }[] | undefined> =
+          episodesByCollectionRef.current;
+        if ("collection" in input.scope && !(input.scope.collection in scopeEpisodes)) {
+          const { data: episodesData, error: episodesError } = await client
+            .query(
+              seriesCollectionEpisodesQuery,
+              { id: input.scope.collection },
+              { requestPolicy: "network-only" },
+            )
+            .toPromise();
+          if (episodesError) throw episodesError;
+          scopeEpisodes = {
+            ...scopeEpisodes,
+            [input.scope.collection]: (episodesData?.collectionById?.episodes ??
+              []) as CollectionEpisode[],
+          };
+        }
+        const replacesPrimary = queueScopeReplacesPrimaryFromTitleFiles(
           input.scope,
-          episodesByCollection,
-          mediaFilesByEpisode,
+          scopeEpisodes,
+          (filesData?.title?.mediaFiles ?? []) as EpisodeMediaFile[],
         );
         const mutation = replacesPrimary
           ? queueReplacementMutation
@@ -1949,8 +1975,6 @@ export const SeriesOverviewContainer = React.memo(function SeriesOverviewContain
     [
       client,
       confirmReplaceConflict,
-      episodesByCollection,
-      mediaFilesByEpisode,
       title,
       refreshTitleDetail,
       setGlobalStatus,
