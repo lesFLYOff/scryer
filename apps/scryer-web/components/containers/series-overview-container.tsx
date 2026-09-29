@@ -1,5 +1,6 @@
 
 import * as React from "react";
+import { useJobRunToasts } from "@/components/root/job-run-provider";
 import { useAutomaticSearch } from "@/lib/hooks/use-automatic-search";
 import { parseSearchSeason } from "@/lib/utils/automatic-search";
 import { facetById } from "@/lib/facets/registry";
@@ -16,7 +17,7 @@ import {
 import {
   addListExclusionMutation,
   deleteEpisodeFilesMutation,
-  deleteTitleMutation,
+  deleteTitlesMutation,
   setCollectionMonitoredMutation,
   queueBestReleaseMutation,
   queueExistingMutation,
@@ -395,6 +396,7 @@ export const SeriesOverviewContainer = React.memo(function SeriesOverviewContain
 }: SeriesOverviewContainerProps) {
   const setGlobalStatus = useGlobalStatus();
   const trackJobRun = useTrackedJobRuns();
+  const { registerInteractiveJobRun } = useJobRunToasts();
   const t = useTranslate();
   const { startAutomaticSearch, isSearching } = useAutomaticSearch();
   const client = useClient();
@@ -1475,40 +1477,53 @@ export const SeriesOverviewContainer = React.memo(function SeriesOverviewContain
         }
       }
 
-      const { error } = await client.mutation(deleteTitleMutation, {
-        input: payload,
+      const { data, error } = await client.mutation<{
+        deleteTitles?: { acceptedTitleIds?: string[]; jobRun?: unknown };
+      }>(deleteTitlesMutation, {
+        input: {
+          items: [{ titleId: payload.titleId, previewFingerprint: payload.previewFingerprint }],
+          deleteFilesOnDisk: payload.deleteFilesOnDisk,
+          typedConfirmation: payload.typedConfirmation,
+        },
       }).toPromise();
       if (error) throw error;
-
-      setGlobalStatus(t("status.titleDeleted", { name: title.name }));
+      const run = normalizeJobRun(data?.deleteTitles?.jobRun);
+      if (!run || !data?.deleteTitles?.acceptedTitleIds?.includes(title.id)) {
+        throw new Error(t("status.apiError"));
+      }
       setDeleteDialogOpen(false);
       setDeleteFilesOnDisk(false);
 
-      // The exclusion is a separate request made only after the delete has
-      // succeeded, so it can never change what the delete removes.
-      if (canManageLists && alsoExcludeFromLists) {
-        setAlsoExcludeFromLists(false);
-        const exclusion = exclusionInputFromTitle({
-          facet: title.facet as Facet,
-          name: title.name,
-          year: title.year,
-          externalIds: title.externalIds,
-        });
-        if (!exclusion) {
-          setGlobalStatus(t("lists.exclusions.deleteNoIds", { name: title.name }));
-        } else {
-          const exclusionFailed = await client
-            .mutation(addListExclusionMutation, { input: exclusion })
-            .toPromise()
-            .then((result) => Boolean(result.error))
-            .catch(() => true);
-          if (exclusionFailed) {
-            setGlobalStatus(
-              t("lists.exclusions.deleteFailed", { name: title.name }),
-            );
+      setAlsoExcludeFromLists(false);
+      // Keep this callback with the global job provider after leaving the detail page.
+      registerInteractiveJobRun(run, (terminalRun) => {
+        if (terminalRun.status !== "COMPLETED") return;
+        void (async () => {
+          if (canManageLists && alsoExcludeFromLists) {
+            const exclusion = exclusionInputFromTitle({
+              facet: title.facet as Facet,
+              name: title.name,
+              year: title.year,
+              externalIds: title.externalIds,
+            });
+            if (!exclusion) {
+              setGlobalStatus(t("lists.exclusions.deleteNoIds", { name: title.name }));
+            } else {
+              const exclusionFailed = await client
+                .mutation(addListExclusionMutation, { input: exclusion })
+                .toPromise()
+                .then((result) => Boolean(result.error))
+                .catch(() => true);
+              if (exclusionFailed) {
+                setGlobalStatus(
+                  t("lists.exclusions.deleteFailed", { name: title.name }),
+                );
+              }
+            }
           }
-        }
-      }
+
+        })();
+      });
 
       if (onBackToList) {
         onBackToList();
@@ -1527,6 +1542,7 @@ export const SeriesOverviewContainer = React.memo(function SeriesOverviewContain
     deleteFilesOnDisk,
     onBackToList,
     onTitleNotFound,
+    registerInteractiveJobRun,
     titleDeletePreview,
     titleDeleteTypedConfirmation,
     setGlobalStatus,
