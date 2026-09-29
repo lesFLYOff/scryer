@@ -668,6 +668,15 @@ pub struct NullExternalImportMonitorSnapshotRepository;
 
 #[async_trait]
 impl ExternalImportMonitorSnapshotRepository for NullExternalImportMonitorSnapshotRepository {
+    async fn claim_external_import_monitor_snapshot(
+        &self,
+        _: &str,
+        _: &str,
+        _: MediaFacet,
+    ) -> AppResult<u64> {
+        Ok(0)
+    }
+
     async fn append_external_import_monitor_snapshot_chunk(
         &self,
         _: &crate::ExternalImportMonitorSnapshotChunk,

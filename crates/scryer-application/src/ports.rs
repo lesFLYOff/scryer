@@ -6589,6 +6589,15 @@ pub trait ImportRepository: Send + Sync {
 
 #[async_trait]
 pub trait ExternalImportMonitorSnapshotRepository: Send + Sync {
+    /// Atomically consume an exact library/facet session, returning its chunk count.
+    /// The caller must supply a unique destination that is never eligible for apply.
+    async fn claim_external_import_monitor_snapshot(
+        &self,
+        session_id: &str,
+        consumed_session_id: &str,
+        facet: MediaFacet,
+    ) -> AppResult<u64>;
+
     async fn append_external_import_monitor_snapshot_chunk(
         &self,
         chunk: &crate::ExternalImportMonitorSnapshotChunk,
