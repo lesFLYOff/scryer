@@ -235,7 +235,7 @@ pub use upstream_scheduler::{
     SchedulerBatchRequest, SchedulerCandidate, SchedulerCandidateId, SchedulerFeedback,
     SchedulerFeedbackOutcome, SchedulerIntent, SchedulerLease, SchedulerOperation,
     SchedulerPluginKind, SchedulerSnapshot, SchedulerSnapshotEntry, SchedulerSnapshotFilter,
-    SearchLearningContext, SkipReason, UpstreamScheduler, rss_poll_is_due,
+    SearchLearningContext, SkipReason, UpstreamScheduler, rss_poll_is_due, rss_poll_reached_marker,
 };
 pub const SCRYER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const LIBRARY_SCAN_MAX_RECURSIVE_DEPTH: usize =

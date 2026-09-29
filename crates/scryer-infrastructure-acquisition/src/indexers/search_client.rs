@@ -1527,52 +1527,136 @@ fn strategy_retry_after(
         })
 }
 
-fn indexer_rss_feedback_summary(
-    lease: &SchedulerLease,
-    response: &IndexerSearchResponse,
-) -> (
-    Option<String>,
-    Option<DateTime<Utc>>,
-    Option<u32>,
-    Vec<String>,
-) {
-    if lease.operation != SchedulerOperation::Rss && lease.intent != SchedulerIntent::BackgroundRss
-    {
-        return (None, None, None, Vec::new());
-    }
+/// What one RSS poll of an indexer returned, gathered from every response
+/// before the results are filtered or handed to scoring.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct RssFeedSummary {
+    /// The marker the poll was asked to read back to, if any.
+    catch_up: Option<IndexerRssCatchUp>,
+    /// Every release identity the poll returned, in feed order.
+    seen_identities: Vec<String>,
+    /// The parsed publish time of each entry in `seen_identities`.
+    published_at: Vec<Option<DateTime<Utc>>>,
+    oldest_published_at: Option<DateTime<Utc>>,
+    /// The indexer reported it stopped paging at its page ceiling.
+    stopped_at_page_ceiling: bool,
+}
 
-    let mut newest_identity = None;
-    let mut newest_published_at = None;
-    let mut fallback_identity = None;
-    let mut seen_identities = Vec::with_capacity(response.results.len());
-    for result in &response.results {
-        let identity = result
-            .guid
-            .clone()
-            .or_else(|| result.link.clone())
-            .or_else(|| result.download_url.clone())
-            .unwrap_or_else(|| result.title.clone());
-        fallback_identity.get_or_insert_with(|| identity.clone());
-        seen_identities.push(identity.clone());
-        let Some(published_at) = result
-            .published_at
-            .as_deref()
-            .and_then(scryer_application::parse_published_at)
-        else {
-            continue;
-        };
-        if newest_published_at.is_none_or(|current| published_at > current) {
-            newest_published_at = Some(published_at);
-            newest_identity = Some(identity);
+impl RssFeedSummary {
+    fn new(catch_up: Option<IndexerRssCatchUp>) -> Self {
+        Self {
+            catch_up,
+            ..Self::default()
         }
     }
 
-    (
-        newest_identity.or(fallback_identity),
-        newest_published_at,
-        Some(response.results.len().min(u32::MAX as usize) as u32),
-        seen_identities,
-    )
+    fn observe(&mut self, results: &[IndexerSearchResult]) {
+        for result in results {
+            // Same field order as the plugin SDK's catch-up identity, so a
+            // plugin can recognise the marker the host stores.
+            let identity = result
+                .guid
+                .clone()
+                .or_else(|| result.link.clone())
+                .or_else(|| result.download_url.clone())
+                .unwrap_or_else(|| result.title.clone());
+            let published_at = result
+                .published_at
+                .as_deref()
+                .and_then(scryer_application::parse_published_at);
+            if let Some(published_at) = published_at
+                && self
+                    .oldest_published_at
+                    .is_none_or(|current| published_at < current)
+            {
+                self.oldest_published_at = Some(published_at);
+            }
+            self.seen_identities.push(identity);
+            self.published_at.push(published_at);
+        }
+    }
+
+    /// Records how the indexer finished this response. Results of a cut-off
+    /// poll are still observed; only coverage is judged differently.
+    fn note_completion(&mut self, completion: &IndexerSearchCompletion) {
+        if matches!(
+            completion,
+            IndexerSearchCompletion::Partial {
+                reason: Some(IndexerSearchIncompleteReason::PageCeilingReached),
+                ..
+            }
+        ) {
+            self.stopped_at_page_ceiling = true;
+        }
+    }
+
+    fn result_count(&self) -> usize {
+        self.seen_identities.len()
+    }
+
+    /// The release to store as the next poll's marker: the greatest publish
+    /// time no later than `observed_at` (ties go to the first in feed order),
+    /// with identity and time from that same release. A future-dated release
+    /// is ignored so it can never pin the marker ahead of real releases. With
+    /// no usable date the first release's identity is returned without a time.
+    fn marker(&self, observed_at: DateTime<Utc>) -> (Option<String>, Option<DateTime<Utc>>) {
+        let mut newest: Option<(usize, DateTime<Utc>)> = None;
+        for (index, published_at) in self.published_at.iter().enumerate() {
+            let Some(published_at) = *published_at else {
+                continue;
+            };
+            if published_at > observed_at {
+                continue;
+            }
+            if newest.is_none_or(|(_, current)| published_at > current) {
+                newest = Some((index, published_at));
+            }
+        }
+        match newest {
+            Some((index, published_at)) => (
+                Some(self.seen_identities[index].clone()),
+                Some(published_at),
+            ),
+            None => (self.seen_identities.first().cloned(), None),
+        }
+    }
+
+    /// Whether the poll reached the marker it was asked to read back to.
+    fn reached_catch_up(&self) -> bool {
+        let Some(catch_up) = self.catch_up.as_ref() else {
+            return true;
+        };
+        scryer_application::rss_poll_reached_marker(
+            catch_up.last_seen_identity.as_deref(),
+            Some(catch_up.last_seen_published_at),
+            &self.seen_identities,
+            self.oldest_published_at,
+            self.stopped_at_page_ceiling,
+        )
+    }
+
+    /// Logs the finished poll: one line per indexer feed, plus a warning when
+    /// it could not read back to the previous poll's newest release.
+    fn log_poll(&self, indexer_name: &str) {
+        let reached = self.reached_catch_up();
+        info!(
+            indexer = indexer_name,
+            results = self.result_count(),
+            catch_up = self.catch_up.is_some(),
+            stopped_at_page_ceiling = self.stopped_at_page_ceiling,
+            reached_previous = reached,
+            "RSS poll finished"
+        );
+        if !reached && let Some(catch_up) = self.catch_up.as_ref() {
+            let gap_end = self.oldest_published_at.unwrap_or_else(Utc::now);
+            warn!(
+                indexer = indexer_name,
+                "rss sync didn't cover the period between {} and {} UTC; releases in that window may have been missed",
+                catch_up.last_seen_published_at.format("%Y-%m-%d %H:%M:%S"),
+                gap_end.format("%Y-%m-%d %H:%M:%S"),
+            );
+        }
+    }
 }
 
 /// Records transport metrics per outbound indexer request.
@@ -2723,7 +2807,9 @@ enum RssRequestForm {
 }
 
 struct RssFeedCacheEntry {
-    cell: tokio::sync::OnceCell<Result<Vec<IndexerSearchResult>, String>>,
+    /// The feed's results and how the indexer finished reading it.
+    cell:
+        tokio::sync::OnceCell<Result<(Vec<IndexerSearchResult>, IndexerSearchCompletion), String>>,
     initialization_lock: Arc<Mutex<()>>,
     feedback_claimed: AtomicBool,
 }
@@ -3013,6 +3099,7 @@ impl MultiIndexerSearchClient {
         &self,
         lease: Option<SchedulerLease>,
         response: &IndexerSearchResponse,
+        rss_summary: Option<&RssFeedSummary>,
         outcome: SchedulerFeedbackOutcome,
         retry_after: Option<std::time::Duration>,
         cooldown_action: RateLimitCooldownAction,
@@ -3020,12 +3107,22 @@ impl MultiIndexerSearchClient {
         let Some(lease) = lease else {
             return;
         };
-        let (
-            rss_last_seen_release_identity,
-            rss_last_seen_release_published_at,
-            rss_feed_result_count,
-            rss_seen_release_identities,
-        ) = indexer_rss_feedback_summary(&lease, response);
+        let is_rss = lease.operation == SchedulerOperation::Rss
+            || lease.intent == SchedulerIntent::BackgroundRss;
+        let rss_summary = is_rss.then(|| {
+            rss_summary.cloned().unwrap_or_else(|| {
+                let mut summary = RssFeedSummary::default();
+                summary.observe(&response.results);
+                summary
+            })
+        });
+        let rss_summary = rss_summary.unwrap_or_default();
+        let observed_at = chrono::Utc::now();
+        let (rss_last_seen_release_identity, rss_last_seen_release_published_at) = if is_rss {
+            rss_summary.marker(observed_at)
+        } else {
+            (None, None)
+        };
         if let Err(error) = self
             .upstream_scheduler
             .record_feedback(SchedulerFeedback {
@@ -3042,9 +3139,12 @@ impl MultiIndexerSearchClient {
                 cooldown_action,
                 rss_last_seen_release_identity,
                 rss_last_seen_release_published_at,
-                rss_feed_result_count,
-                rss_seen_release_identities,
-                observed_at: chrono::Utc::now(),
+                rss_feed_result_count: is_rss
+                    .then(|| rss_summary.result_count().min(u32::MAX as usize) as u32),
+                rss_seen_release_identities: rss_summary.seen_identities,
+                rss_oldest_release_published_at: rss_summary.oldest_published_at,
+                rss_stopped_at_page_ceiling: rss_summary.stopped_at_page_ceiling,
+                observed_at,
             })
             .await
         {
@@ -3077,6 +3177,7 @@ impl MultiIndexerSearchClient {
             self.record_indexer_scheduler_feedback(
                 lease,
                 &response,
+                None,
                 SchedulerFeedbackOutcome::TransportFailure,
                 None,
                 RateLimitCooldownAction::None,
@@ -3100,6 +3201,7 @@ impl MultiIndexerSearchClient {
         self.record_indexer_scheduler_feedback(
             lease,
             &response,
+            None,
             outcome,
             retry_after,
             cooldown_action,
@@ -4821,7 +4923,7 @@ impl IndexerClient for MultiIndexerSearchClient {
             String,
             String,
             Option<SchedulerLease>,
-            AppResult<IndexerSearchResponse>,
+            AppResult<(IndexerSearchResponse, Option<RssFeedSummary>)>,
             bool,
         )>::new();
         let search_limit =
@@ -5206,7 +5308,7 @@ impl IndexerClient for MultiIndexerSearchClient {
                                     // An RSS poll has no subject, so no year.
                                     year: None,
                                     tagged_aliases,
-                                    rss_catch_up,
+                                    rss_catch_up: rss_catch_up.clone(),
                                 };
                                 let search_response = within_search_window(
                                     client.search_strategy(
@@ -5223,7 +5325,7 @@ impl IndexerClient for MultiIndexerSearchClient {
 
                                 match search_response {
                                     Ok(Ok(mut response)) => {
-                                        info!(indexer = indexer_name.as_str(), count = response.results.len(), "RSS feed cached");
+                                        debug!(indexer = indexer_name.as_str(), count = response.results.len(), "RSS feed cached");
                                         stats_tracker.record_query(&indexer_id, &indexer_name, true);
                                         let had_in_memory_backoff = backoff_tracker.record_success(&indexer_id).await;
                                         if had_in_memory_backoff || had_persisted_system_backoff {
@@ -5251,7 +5353,7 @@ impl IndexerClient for MultiIndexerSearchClient {
                                         for result in &mut response.results {
                                             result.indexer_id = Some(indexer_id.clone());
                                         }
-                                        Ok(response.results)
+                                        Ok((response.results, response.completion))
                                     }
                                     Ok(Err(err)) => {
                                         if err.is_canceled() {
@@ -5338,12 +5440,12 @@ impl IndexerClient for MultiIndexerSearchClient {
                             );
                         }
                         let should_record_feedback = cache_entry.claim_feedback();
-                        let results = match cached_results {
-                            Ok(mut results) => {
+                        let (results, feed_completion) = match cached_results {
+                            Ok((mut results, completion)) => {
                                 for result in &mut results {
                                     result.indexer_id.get_or_insert_with(|| indexer_id.clone());
                                 }
-                                results
+                                (results, completion)
                             }
                             Err(error) => {
                                 return (
@@ -5356,6 +5458,9 @@ impl IndexerClient for MultiIndexerSearchClient {
                             }
                         };
 
+                        let mut rss_summary = RssFeedSummary::new(rss_catch_up);
+                        rss_summary.observe(&results);
+                        rss_summary.note_completion(&feed_completion);
                         let response = IndexerSearchResponse {
                             results,
 
@@ -5370,7 +5475,7 @@ impl IndexerClient for MultiIndexerSearchClient {
                             indexer_id,
                             indexer_name,
                             scheduler_lease_for_task.clone(),
-                            Ok(response),
+                            Ok((response, Some(rss_summary))),
                             should_record_feedback,
                         )
                 });
@@ -5579,6 +5684,8 @@ impl IndexerClient for MultiIndexerSearchClient {
                     );
                 }
                 let mut collected_results = Vec::new();
+                let mut rss_summary =
+                    is_rss_request.then(|| RssFeedSummary::new(rss_catch_up.clone()));
                 let mut reusable_strategies = reusable_strategies;
                 let mut any_strategy_fired = false;
                 let mut all_strategies_complete = true;
@@ -5721,6 +5828,10 @@ impl IndexerClient for MultiIndexerSearchClient {
                                 );
                             }
                             let raw_result_count = response.results.len();
+                            if let Some(summary) = rss_summary.as_mut() {
+                                summary.observe(&response.results);
+                                summary.note_completion(&response.completion);
+                            }
                             batch_health.mark_success();
                             debug!(
                                 indexer = indexer_name.as_str(),
@@ -6067,6 +6178,10 @@ impl IndexerClient for MultiIndexerSearchClient {
                                     );
                                 }
                                 let raw_result_count = response.results.len();
+                                if let Some(summary) = rss_summary.as_mut() {
+                                    summary.observe(&response.results);
+                                    summary.note_completion(&response.completion);
+                                }
                                 batch_health.mark_success();
                                 debug!(
                                     indexer = indexer_name.as_str(),
@@ -6341,7 +6456,7 @@ impl IndexerClient for MultiIndexerSearchClient {
                     indexer_id,
                     indexer_name,
                     scheduler_lease_for_task.clone(),
-                    Ok(IndexerSearchResponse {
+                    Ok((IndexerSearchResponse {
                         results: collected_results,
 
                         indexer_outcomes: task_indexer_outcomes,
@@ -6362,7 +6477,7 @@ impl IndexerClient for MultiIndexerSearchClient {
                         api_max: quota_observation.api_max,
                         grab_current: quota_observation.grab_current,
                         grab_max: quota_observation.grab_max,
-                    }),
+                    }, rss_summary)),
                     any_strategy_fired,
                 )
             });
@@ -6402,8 +6517,17 @@ impl IndexerClient for MultiIndexerSearchClient {
             };
 
             match join_result {
-                Ok((id, name, scheduler_lease, Ok(mut response), should_record_feedback)) => {
+                Ok((
+                    id,
+                    name,
+                    scheduler_lease,
+                    Ok((mut response, rss_summary)),
+                    should_record_feedback,
+                )) => {
                     let empty = response.results.is_empty();
+                    if should_record_feedback && let Some(summary) = rss_summary.as_ref() {
+                        summary.log_poll(name.as_str());
+                    }
                     if should_record_feedback {
                         // A fired query that returned nothing is an
                         // EmptySuccess, distinct from a hitful Success. Plan 112
@@ -6413,6 +6537,7 @@ impl IndexerClient for MultiIndexerSearchClient {
                         self.record_indexer_scheduler_feedback(
                             scheduler_lease,
                             &response,
+                            rss_summary.as_ref(),
                             if empty {
                                 SchedulerFeedbackOutcome::EmptySuccess
                             } else {
@@ -8247,6 +8372,8 @@ mod tests {
                 rss_last_seen_release_published_at: None,
                 rss_feed_result_count: Some(0),
                 rss_seen_release_identities: Vec::new(),
+                rss_oldest_release_published_at: None,
+                rss_stopped_at_page_ceiling: false,
                 observed_at: last_successful_poll_at,
             })
             .await
@@ -8268,6 +8395,8 @@ mod tests {
                 rss_last_seen_release_published_at: None,
                 rss_feed_result_count: None,
                 rss_seen_release_identities: Vec::new(),
+                rss_oldest_release_published_at: None,
+                rss_stopped_at_page_ceiling: false,
                 observed_at: now,
             })
             .await
@@ -8407,6 +8536,8 @@ mod tests {
                 rss_last_seen_release_published_at: None,
                 rss_feed_result_count: Some(0),
                 rss_seen_release_identities: Vec::new(),
+                rss_oldest_release_published_at: None,
+                rss_stopped_at_page_ceiling: false,
                 observed_at: now,
             })
             .await
@@ -8508,6 +8639,7 @@ mod tests {
         season: Option<u32>,
         episode: Option<u32>,
         absolute_episode: Option<u32>,
+        rss_catch_up: Option<IndexerRssCatchUp>,
     }
 
     type ResponseFn = dyn Fn(&RecordedCall) -> AppResult<IndexerSearchResponse> + Send + Sync;
@@ -8547,6 +8679,32 @@ mod tests {
                 season,
                 episode,
                 absolute_episode,
+                rss_catch_up: None,
+            };
+            self.calls
+                .lock()
+                .expect("call log mutex")
+                .push(call.clone());
+            (self.responder)(&call)
+        }
+
+        async fn search_strategy(
+            &self,
+            request: IndexerSearchStrategyRequest,
+            _mode: SearchMode,
+            _operation: IndexerErrorOperation,
+            _cancel_token: CancellationToken,
+        ) -> AppResult<IndexerSearchResponse> {
+            let call = RecordedCall {
+                query: request.query,
+                ids: request.ids,
+                category: request.category,
+                facet: request.facet,
+                categories: request.newznab_categories.unwrap_or_default(),
+                season: request.season,
+                episode: request.episode,
+                absolute_episode: request.absolute_episode,
+                rss_catch_up: request.rss_catch_up,
             };
             self.calls
                 .lock()
@@ -11686,6 +11844,418 @@ mod tests {
         let feedback_candidate_ids = recorded_feedback.lock().expect("scheduler feedback");
         assert_eq!(feedback_candidate_ids.len(), 2);
         assert_eq!(response.results.len(), 2);
+    }
+
+    fn fixed_utc(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("fixture time should parse")
+            .with_timezone(&Utc)
+    }
+
+    /// A feed item as a usenet indexer returns it: RFC 2822 publish time.
+    fn dated_rss_result(guid: &str, published_at: DateTime<Utc>) -> IndexerSearchResult {
+        let mut result = search_result(&format!("Synthetic.Feed.{guid}.1080p.WEB-DL"));
+        result.guid = Some(guid.to_string());
+        result.published_at = Some(published_at.to_rfc2822());
+        result
+    }
+
+    /// Records a successful earlier RSS poll of the mock indexer's category set,
+    /// far enough back that the next poll is due.
+    async fn record_previous_rss_poll(
+        scheduler: &crate::upstream_scheduler::InMemoryUpstreamScheduler,
+        rss_request_key: &str,
+        marker_identity: &str,
+        marker_published_at: DateTime<Utc>,
+    ) {
+        let config = mock_indexer_config();
+        let (host_key, destination_key) =
+            MultiIndexerSearchClient::scheduler_keys_for_indexer(&config);
+        let account_quota_key: Option<scryer_application::AccountQuotaKey> =
+            Some(config.id.clone().into());
+        let observed_at = marker_published_at + Duration::minutes(1);
+        scheduler
+            .record_feedback(SchedulerFeedback {
+                lease: Some(SchedulerLease {
+                    lease_id: uuid::Uuid::new_v4().to_string(),
+                    candidate_id: SchedulerCandidateId::new(),
+                    host_key: host_key.clone(),
+                    destination_key: destination_key.clone(),
+                    account_quota_key: account_quota_key.clone(),
+                    rss_request_key: Some(rss_request_key.to_string()),
+                    operation: SchedulerOperation::Rss,
+                    intent: SchedulerIntent::BackgroundRss,
+                    issued_at: observed_at,
+                }),
+                host_key,
+                destination_key,
+                account_quota_key,
+                outcome: SchedulerFeedbackOutcome::Success,
+                observed_api_current: None,
+                observed_api_max: None,
+                observed_grab_current: None,
+                observed_grab_max: None,
+                retry_after: None,
+                cooldown_action: RateLimitCooldownAction::None,
+                rss_last_seen_release_identity: Some(marker_identity.to_string()),
+                rss_last_seen_release_published_at: Some(marker_published_at),
+                rss_feed_result_count: Some(1),
+                rss_seen_release_identities: vec![marker_identity.to_string()],
+                rss_oldest_release_published_at: Some(marker_published_at),
+                rss_stopped_at_page_ceiling: false,
+                observed_at,
+            })
+            .await
+            .expect("previous RSS poll should record");
+    }
+
+    async fn run_rss_poll(
+        client: &MultiIndexerSearchClient,
+        categories: &[&str],
+    ) -> IndexerSearchResponse {
+        client
+            .search(
+                String::new(),
+                HashMap::new(),
+                None,
+                None,
+                None,
+                Some(categories.iter().map(|value| value.to_string()).collect()),
+                None,
+                SearchMode::Auto,
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("rss poll should succeed")
+    }
+
+    async fn rss_snapshot_entry(
+        scheduler: &crate::upstream_scheduler::InMemoryUpstreamScheduler,
+        rss_request_key: &str,
+    ) -> scryer_application::SchedulerSnapshotEntry {
+        scheduler
+            .snapshot(scryer_application::SchedulerSnapshotFilter::default())
+            .await
+            .expect("scheduler snapshot should succeed")
+            .entries
+            .into_iter()
+            .find(|entry| entry.rss_request_key.as_deref() == Some(rss_request_key))
+            .expect("rss cadence entry for the category set")
+    }
+
+    #[tokio::test]
+    async fn rss_poll_sends_the_marker_stored_for_its_own_category_set() {
+        let movies_marker_at = fixed_utc("2026-09-20T10:00:00Z");
+        let series_marker_at = fixed_utc("2026-09-20T11:30:00Z");
+        let scheduler = Arc::new(crate::upstream_scheduler::InMemoryUpstreamScheduler::new());
+        record_previous_rss_poll(
+            &scheduler,
+            "rss:2000",
+            "movies-marker-guid",
+            movies_marker_at,
+        )
+        .await;
+        record_previous_rss_poll(
+            &scheduler,
+            "rss:5000",
+            "series-marker-guid",
+            series_marker_at,
+        )
+        .await;
+        let mut caps = movie_caps();
+        caps.rss = true;
+        let (client, calls) = scripted_search_client(caps, |_| response_with_titles(&[]));
+        let client = client.with_upstream_scheduler(scheduler);
+
+        run_rss_poll(&client, &["2000", "5000"]).await;
+
+        let calls = calls.lock().expect("call log mutex");
+        let catch_up_for = |category: &str| {
+            calls
+                .iter()
+                .find(|call| call.categories == vec![category.to_string()])
+                .unwrap_or_else(|| panic!("no rss call for category {category}"))
+                .rss_catch_up
+                .clone()
+        };
+        assert_eq!(
+            catch_up_for("2000"),
+            Some(IndexerRssCatchUp {
+                last_seen_published_at: movies_marker_at,
+                last_seen_identity: Some("movies-marker-guid".to_string()),
+            })
+        );
+        assert_eq!(
+            catch_up_for("5000"),
+            Some(IndexerRssCatchUp {
+                last_seen_published_at: series_marker_at,
+                last_seen_identity: Some("series-marker-guid".to_string()),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn rss_poll_without_a_stored_marker_sends_no_catch_up() {
+        // Admits every candidate and holds no cadence, so the indexer is polled
+        // with no stored marker regardless of where the wall clock falls in its
+        // first-poll phase window.
+        let scheduler = Arc::new(RecordingScheduler::default());
+        let mut caps = movie_caps();
+        caps.rss = true;
+        let (client, calls) = scripted_search_client(caps, |_| response_with_titles(&[]));
+        let client = client.with_upstream_scheduler(scheduler);
+
+        run_rss_poll(&client, &["2000"]).await;
+
+        let calls = calls.lock().expect("call log mutex");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].rss_catch_up, None);
+    }
+
+    #[tokio::test]
+    async fn a_multi_page_rss_poll_reaching_the_marker_moves_it_without_a_gap() {
+        let marker_at = fixed_utc("2026-09-20T10:00:00Z");
+        let newest_at = fixed_utc("2026-09-20T14:00:00Z");
+        let scheduler = Arc::new(crate::upstream_scheduler::InMemoryUpstreamScheduler::new());
+        record_previous_rss_poll(&scheduler, "rss:2000", "marker-guid", marker_at).await;
+        let mut caps = movie_caps();
+        caps.rss = true;
+        let (client, _calls) = scripted_search_client(caps, move |_| {
+            // 250 results, as a plugin returns after reading several pages.
+            // Feed order is index order: the first item is an old post that
+            // was indexed late, so the newest publish time is not first.
+            let mut results = vec![dated_rss_result(
+                "late-indexed-guid",
+                marker_at - Duration::hours(6),
+            )];
+            results.push(dated_rss_result("newest-guid", newest_at));
+            for index in 0..247 {
+                results.push(dated_rss_result(
+                    &format!("paged-guid-{index}"),
+                    newest_at - Duration::minutes(index + 1),
+                ));
+            }
+            // The last page ends just past the previous marker.
+            results.push(dated_rss_result(
+                "oldest-guid",
+                marker_at - Duration::minutes(1),
+            ));
+            Ok(IndexerSearchResponse {
+                completion: IndexerSearchCompletion::Complete,
+                indexer_outcomes: Vec::new(),
+                results,
+                api_current: None,
+                api_max: None,
+                grab_current: None,
+                grab_max: None,
+            })
+        });
+        let client = client.with_upstream_scheduler(scheduler.clone());
+
+        let response = run_rss_poll(&client, &["2000"]).await;
+
+        assert_eq!(response.results.len(), 250);
+        let entry = rss_snapshot_entry(&scheduler, "rss:2000").await;
+        assert_eq!(
+            entry.rss_last_seen_release_identity.as_deref(),
+            Some("newest-guid")
+        );
+        assert_eq!(entry.rss_last_seen_release_published_at, Some(newest_at));
+        assert_eq!(entry.rss_estimated_feed_depth, Some(250));
+        assert_eq!(entry.rss_last_feed_gap_start_at, None);
+        assert_eq!(entry.rss_last_feed_gap_end_at, None);
+    }
+
+    #[tokio::test]
+    async fn a_multi_page_rss_poll_short_of_the_marker_records_the_uncovered_window() {
+        let marker_at = fixed_utc("2026-09-20T10:00:00Z");
+        let newest_at = fixed_utc("2026-09-20T14:00:00Z");
+        let oldest_at = fixed_utc("2026-09-20T12:00:00Z");
+        let scheduler = Arc::new(crate::upstream_scheduler::InMemoryUpstreamScheduler::new());
+        record_previous_rss_poll(&scheduler, "rss:2000", "marker-guid", marker_at).await;
+        let mut caps = movie_caps();
+        caps.rss = true;
+        let (client, _calls) = scripted_search_client(caps, move |_| {
+            // The plugin hit its page limit before reaching the marker.
+            let mut results = vec![dated_rss_result("newest-guid", newest_at)];
+            for index in 0..118 {
+                results.push(dated_rss_result(
+                    &format!("paged-guid-{index}"),
+                    newest_at - Duration::minutes(index + 1),
+                ));
+            }
+            results.push(dated_rss_result("oldest-guid", oldest_at));
+            Ok(IndexerSearchResponse {
+                completion: IndexerSearchCompletion::Complete,
+                indexer_outcomes: Vec::new(),
+                results,
+                api_current: None,
+                api_max: None,
+                grab_current: None,
+                grab_max: None,
+            })
+        });
+        let client = client.with_upstream_scheduler(scheduler.clone());
+
+        let response = run_rss_poll(&client, &["2000"]).await;
+
+        assert_eq!(response.results.len(), 120);
+        let entry = rss_snapshot_entry(&scheduler, "rss:2000").await;
+        assert_eq!(entry.rss_last_feed_gap_start_at, Some(marker_at));
+        assert_eq!(entry.rss_last_feed_gap_end_at, Some(oldest_at));
+        assert_eq!(
+            entry.rss_last_seen_release_identity.as_deref(),
+            Some("newest-guid")
+        );
+        assert_eq!(entry.rss_last_seen_release_published_at, Some(newest_at));
+    }
+
+    fn page_ceiling_response(
+        results: Vec<IndexerSearchResult>,
+    ) -> AppResult<IndexerSearchResponse> {
+        Ok(IndexerSearchResponse {
+            completion: IndexerSearchCompletion::Partial {
+                reason: Some(IndexerSearchIncompleteReason::PageCeilingReached),
+                retry_after: None,
+            },
+            indexer_outcomes: Vec::new(),
+            results,
+            api_current: None,
+            api_max: None,
+            grab_current: None,
+            grab_max: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_poll_cut_off_at_the_page_ceiling_records_a_gap_despite_an_old_stray_release() {
+        let marker_at = fixed_utc("2026-09-20T10:00:00Z");
+        let newest_at = fixed_utc("2026-09-20T14:00:00Z");
+        let stray_at = fixed_utc("2026-08-01T09:00:00Z");
+        let scheduler = Arc::new(crate::upstream_scheduler::InMemoryUpstreamScheduler::new());
+        record_previous_rss_poll(&scheduler, "rss:2000", "marker-guid", marker_at).await;
+        let mut caps = movie_caps();
+        caps.rss = true;
+        let (client, _calls) = scripted_search_client(caps, move |_| {
+            let mut results = vec![dated_rss_result("newest-guid", newest_at)];
+            for index in 0..98 {
+                results.push(dated_rss_result(
+                    &format!("paged-guid-{index}"),
+                    newest_at - Duration::minutes(index + 1),
+                ));
+            }
+            // An old post listed late: its post time predates the marker even
+            // though the read never got back to the marker.
+            results.push(dated_rss_result("late-listed-guid", stray_at));
+            page_ceiling_response(results)
+        });
+        let client = client.with_upstream_scheduler(scheduler.clone());
+
+        let response = run_rss_poll(&client, &["2000"]).await;
+
+        // The cut-off poll's releases still reach RSS evaluation.
+        assert_eq!(response.results.len(), 100);
+        let entry = rss_snapshot_entry(&scheduler, "rss:2000").await;
+        assert_eq!(entry.rss_last_feed_gap_start_at, Some(marker_at));
+        assert_eq!(entry.rss_last_feed_gap_end_at, Some(stray_at));
+        assert_eq!(
+            entry.rss_last_seen_release_identity.as_deref(),
+            Some("newest-guid")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poll_cut_off_at_the_page_ceiling_that_returned_the_marker_records_no_gap() {
+        let marker_at = fixed_utc("2026-09-20T10:00:00Z");
+        let newest_at = fixed_utc("2026-09-20T14:00:00Z");
+        let scheduler = Arc::new(crate::upstream_scheduler::InMemoryUpstreamScheduler::new());
+        record_previous_rss_poll(&scheduler, "rss:2000", "marker-guid", marker_at).await;
+        let mut caps = movie_caps();
+        caps.rss = true;
+        let (client, _calls) = scripted_search_client(caps, move |_| {
+            page_ceiling_response(vec![
+                dated_rss_result("newest-guid", newest_at),
+                dated_rss_result("marker-guid", marker_at),
+            ])
+        });
+        let client = client.with_upstream_scheduler(scheduler.clone());
+
+        run_rss_poll(&client, &["2000"]).await;
+
+        let entry = rss_snapshot_entry(&scheduler, "rss:2000").await;
+        assert_eq!(entry.rss_last_feed_gap_start_at, None);
+        assert_eq!(entry.rss_last_feed_gap_end_at, None);
+        assert_eq!(entry.rss_last_seen_release_published_at, Some(newest_at));
+    }
+
+    #[test]
+    fn a_page_ceiling_stop_is_logged_as_uncovered_unless_the_marker_came_back() {
+        let marker_at = fixed_utc("2026-09-20T10:00:00Z");
+        let catch_up = IndexerRssCatchUp {
+            last_seen_published_at: marker_at,
+            last_seen_identity: Some("marker-guid".to_string()),
+        };
+        let ceiling = IndexerSearchCompletion::Partial {
+            reason: Some(IndexerSearchIncompleteReason::PageCeilingReached),
+            retry_after: None,
+        };
+
+        let mut stray = RssFeedSummary::new(Some(catch_up.clone()));
+        stray.observe(&[
+            dated_rss_result("newest-guid", marker_at + Duration::hours(4)),
+            dated_rss_result("late-listed-guid", marker_at - Duration::days(30)),
+        ]);
+        assert!(
+            stray.reached_catch_up(),
+            "a complete read keeps the date rule"
+        );
+        stray.note_completion(&ceiling);
+        assert!(!stray.reached_catch_up());
+
+        let mut returned = RssFeedSummary::new(Some(catch_up));
+        returned.observe(&[
+            dated_rss_result("newest-guid", marker_at + Duration::hours(4)),
+            dated_rss_result("marker-guid", marker_at),
+        ]);
+        returned.note_completion(&ceiling);
+        assert!(returned.reached_catch_up());
+
+        // Other partial reasons keep the date rule.
+        let mut unattested = RssFeedSummary::new(stray.catch_up.clone());
+        unattested.observe(&[dated_rss_result(
+            "late-listed-guid",
+            marker_at - Duration::days(30),
+        )]);
+        unattested.note_completion(&IndexerSearchCompletion::Partial {
+            reason: Some(IndexerSearchIncompleteReason::Unattested),
+            retry_after: None,
+        });
+        assert!(unattested.reached_catch_up());
+    }
+
+    #[test]
+    fn rss_feed_summary_marker_skips_future_dates_and_keeps_the_first_tie() {
+        let observed_at = fixed_utc("2026-09-20T12:00:00Z");
+        let tie_at = fixed_utc("2026-09-20T11:00:00Z");
+        let mut summary = RssFeedSummary::default();
+        summary.observe(&[
+            dated_rss_result("future-guid", observed_at + Duration::days(1)),
+            dated_rss_result("first-tie-guid", tie_at),
+            dated_rss_result("second-tie-guid", tie_at),
+            dated_rss_result("older-guid", tie_at - Duration::hours(1)),
+        ]);
+
+        assert_eq!(
+            summary.marker(observed_at),
+            (Some("first-tie-guid".to_string()), Some(tie_at))
+        );
+        assert_eq!(
+            summary.oldest_published_at,
+            Some(tie_at - Duration::hours(1))
+        );
     }
 
     #[tokio::test]

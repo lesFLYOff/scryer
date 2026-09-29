@@ -4078,7 +4078,10 @@ mod tests {
             title: "Sample.Show.S01E01.1080p".into(),
             ..PluginSearchResult::default()
         };
-        assert_eq!(PluginRssCatchUp::identity_of(&result), "Sample.Show.S01E01.1080p");
+        assert_eq!(
+            PluginRssCatchUp::identity_of(&result),
+            "Sample.Show.S01E01.1080p"
+        );
         result.download_url = Some("https://indexer.invalid/get/1".into());
         assert_eq!(
             PluginRssCatchUp::identity_of(&result),

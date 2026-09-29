@@ -1862,6 +1862,64 @@ impl IndexerClient for WasmIndexerClient {
 mod tests {
     use super::*;
 
+    fn rss_strategy(
+        rss_catch_up: Option<scryer_application::IndexerRssCatchUp>,
+    ) -> IndexerSearchStrategyRequest {
+        IndexerSearchStrategyRequest {
+            strategy_id: "rss-strategy".to_string(),
+            labels: vec!["rss".to_string()],
+            query: String::new(),
+            ids: std::collections::HashMap::new(),
+            category: None,
+            facet: None,
+            id_search_facet: None,
+            newznab_categories: Some(vec!["2000".to_string()]),
+            season: None,
+            episode: None,
+            absolute_episode: None,
+            year: None,
+            tagged_aliases: Vec::new(),
+            rss_catch_up,
+        }
+    }
+
+    #[test]
+    fn strategy_request_carries_the_rss_marker_to_the_plugin() {
+        let marker_at = chrono::DateTime::parse_from_rfc3339("2026-09-20T10:00:00Z")
+            .expect("fixture time should parse")
+            .with_timezone(&chrono::Utc);
+        let request = plugin_search_request_from_strategy(
+            rss_strategy(Some(scryer_application::IndexerRssCatchUp {
+                last_seen_published_at: marker_at,
+                last_seen_identity: Some("marker-guid".to_string()),
+            })),
+            SearchMode::Auto,
+        );
+
+        assert_eq!(
+            request.rss_catch_up,
+            Some(scryer_plugin_sdk::PluginRssCatchUp {
+                last_seen_published_at: "2026-09-20T10:00:00Z".to_string(),
+                last_seen_identity: Some("marker-guid".to_string()),
+            })
+        );
+        assert_eq!(request.categories, vec!["2000".to_string()]);
+        let wire = serde_json::to_value(&request).expect("request should serialize");
+        assert_eq!(
+            wire["rss_catch_up"]["last_seen_published_at"],
+            "2026-09-20T10:00:00Z"
+        );
+    }
+
+    #[test]
+    fn strategy_request_without_a_marker_omits_rss_catch_up() {
+        let request = plugin_search_request_from_strategy(rss_strategy(None), SearchMode::Auto);
+
+        assert_eq!(request.rss_catch_up, None);
+        let wire = serde_json::to_value(&request).expect("request should serialize");
+        assert!(wire.get("rss_catch_up").is_none());
+    }
+
     #[test]
     fn grab_magnet_payload_resolves_without_torrent_bytes() {
         let uri = "magnet:?xt=urn:btih:ABCDEF0123456789ABCDEF0123456789ABCDEF01";
