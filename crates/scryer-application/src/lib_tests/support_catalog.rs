@@ -21,6 +21,7 @@ pub(super) type PausedDownloadRequests = Arc<Mutex<Vec<PausedDownloadRequest>>>;
 #[derive(Default)]
 pub(super) struct MockTitleRepo {
     pub(super) store: Arc<Mutex<Vec<Title>>>,
+    pub(super) fail_monitoring_for: Mutex<HashSet<String>>,
     /// The title tag registry, in definition order. Mirrors the store's
     /// behaviour rather than its SQL: unique labels, a rename that rewrites
     /// every bag carrying the old label, and a delete that strips it.
@@ -1170,6 +1171,11 @@ impl TitleRepository for MockTitleRepo {
     }
 
     async fn update_monitored(&self, id: &str, monitored: bool) -> AppResult<Title> {
+        if self.fail_monitoring_for.lock().await.contains(id) {
+            return Err(AppError::Repository(
+                "injected monitoring write failure".into(),
+            ));
+        }
         let mut list = self.store.lock().await;
         let title = list
             .iter_mut()
