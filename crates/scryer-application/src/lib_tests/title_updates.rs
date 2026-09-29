@@ -1297,7 +1297,7 @@ async fn external_import_monitor_snapshot_failures_continue_and_never_replay() {
                 app.services
                     .catalog
                     .shows
-                    .set_collections_monitored(&[collection.id.clone()], false)
+                    .set_collections_monitored(std::slice::from_ref(&collection.id), false)
                     .await
                     .unwrap();
                 let episode = app
@@ -1467,7 +1467,7 @@ async fn external_import_monitor_snapshot_partial_child_failure_emits_activity_a
             .await
             .unwrap();
         shows
-            .set_collections_monitored(&[collection.id.clone()], false)
+            .set_collections_monitored(std::slice::from_ref(&collection.id), false)
             .await
             .unwrap();
         let episode = app
@@ -1488,7 +1488,7 @@ async fn external_import_monitor_snapshot_partial_child_failure_emits_activity_a
             .await
             .unwrap();
         shows
-            .set_episodes_monitored(&[episode.id.clone()], false)
+            .set_episodes_monitored(std::slice::from_ref(&episode.id), false)
             .await
             .unwrap();
         shows

@@ -328,7 +328,7 @@ impl AppUseCase {
             self.services
                 .catalog
                 .titles
-                .set_titles_monitored(&[title.id.clone()], monitored)
+                .set_titles_monitored(std::slice::from_ref(&title.id), monitored)
                 .await?;
             title.monitored = monitored;
             *persisted_change = true;

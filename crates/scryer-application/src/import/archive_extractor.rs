@@ -496,10 +496,9 @@ async fn prepare_workspace_output_dir(workspace_root: &Path, output_dir: &Path) 
 async fn discard_workspace_output_dir(workspace_root: &Path, output_dir: &Path) {
     if is_archive_staging_dir(workspace_root)
         && output_dir.parent() == Some(workspace_root)
-        && output_dir.file_name().is_some_and(|name| {
-            name.to_str()
-                .is_some_and(|name| is_workspace_output_dir_name(name))
-        })
+        && output_dir
+            .file_name()
+            .is_some_and(|name| name.to_str().is_some_and(is_workspace_output_dir_name))
     {
         let _ = tokio::fs::remove_dir_all(output_dir).await;
     }
@@ -2473,12 +2472,14 @@ mod tests {
         Locked(&'static str),
     }
 
+    type TreeArchiveCall = (String, PathBuf, Option<String>);
+
     /// Answers extraction calls per archive name, like a torrent holding
     /// several archive sets and archives packed inside archives. Every call
     /// first writes a partial member, so leftovers of refused attempts show.
     struct TreeArchiveClient {
         script: std::collections::HashMap<&'static str, TreeStep>,
-        calls: Arc<Mutex<Vec<(String, PathBuf, Option<String>)>>>,
+        calls: Arc<Mutex<Vec<TreeArchiveCall>>>,
     }
 
     #[async_trait::async_trait]
