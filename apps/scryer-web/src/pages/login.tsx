@@ -1238,21 +1238,6 @@ export default function LoginPage() {
         <div className="space-y-3">
           {localPasswordAvailable ? (
             <>
-              {showLoginMethodChooser && !passwordFormVisible ? (
-                <button
-                  id="login-password-method"
-                  type="button"
-                  onClick={() => setActiveMethod("password")}
-                  disabled={anySubmitting}
-                  aria-controls="login-form"
-                  aria-expanded={false}
-                  className={AUTH_SECONDARY_BUTTON_CLASS}
-                >
-                  <KeyRound className="h-4 w-4" aria-hidden="true" />
-                  {t("auth.signInWithScryerPassword")}
-                </button>
-              ) : null}
-
               {passwordFormVisible ? (
                 <form id="login-form" onSubmit={handleSubmit} className="space-y-5">
                     <div className="space-y-1.5">
@@ -1321,49 +1306,10 @@ export default function LoginPage() {
             </>
           ) : null}
 
-          {passkeyEnabled ? (
-            <button
-              id="login-passkey-submit"
-              type="button"
-              onClick={handlePasskeySignIn}
-              disabled={anySubmitting}
-              className={AUTH_SECONDARY_BUTTON_CLASS}
-            >
-              {passkeySubmitting ? (
-                <LoadingMark className="h-4 w-4" />
-              ) : (
-                <Fingerprint className="h-4 w-4" aria-hidden="true" />
-              )}
-              {passkeySubmitting ? t("auth.passkeySigningIn") : "Sign in with a passkey"}
-            </button>
-          ) : null}
+
 
           {jellyfinLoginAvailable ? (
             <>
-              {showLoginMethodChooser ? (
-                <button
-                  id="login-jellyfin-method"
-                  type="button"
-                  onClick={() =>
-                    setActiveMethod((current) =>
-                      current === "jellyfin" ? null : "jellyfin",
-                    )
-                  }
-                  disabled={anySubmitting}
-                  aria-controls="jellyfin-login-form"
-                  aria-expanded={activeMethod === "jellyfin"}
-                  className={AUTH_SECONDARY_BUTTON_CLASS}
-                >
-                  <img
-                    src="/auth-providers/jellyfin.svg"
-                    alt=""
-                    aria-hidden="true"
-                    className="h-4 w-4"
-                  />
-                  {t("auth.signInWithJellyfin")}
-                </button>
-              ) : null}
-
               {jellyfinFormVisible ? (
                 // Jellyfin credentials are a separate account from the Scryer
                 // login, so this form opts out of password-manager autofill and
@@ -1438,28 +1384,6 @@ export default function LoginPage() {
 
           {embyLoginAvailable ? (
             <>
-              {showLoginMethodChooser ? (
-                <button
-                  id="login-emby-method"
-                  type="button"
-                  onClick={() =>
-                    setActiveMethod((current) => (current === "emby" ? null : "emby"))
-                  }
-                  disabled={anySubmitting}
-                  aria-controls="emby-login-form"
-                  aria-expanded={activeMethod === "emby"}
-                  className={AUTH_SECONDARY_BUTTON_CLASS}
-                >
-                  <img
-                    src="/auth-providers/emby.svg"
-                    alt=""
-                    aria-hidden="true"
-                    className="h-4 w-4"
-                  />
-                  Sign in with Emby
-                </button>
-              ) : null}
-
               {embyFormVisible ? (
                 <form
                   id="emby-login-form"
@@ -1546,6 +1470,78 @@ export default function LoginPage() {
                 </form>
               ) : null}
             </>
+          ) : null}
+
+          {localPasswordAvailable && showLoginMethodChooser && !passwordFormVisible ? (
+            <button
+              id="login-password-method"
+              type="button"
+              onClick={() => setActiveMethod("password")}
+              disabled={anySubmitting}
+              aria-controls="login-form"
+              aria-expanded={false}
+              className={AUTH_SECONDARY_BUTTON_CLASS}
+            >
+              <KeyRound className="h-4 w-4" aria-hidden="true" />
+              {t("auth.signInWithScryerPassword")}
+            </button>
+          ) : null}
+
+          {jellyfinLoginAvailable && showLoginMethodChooser && !jellyfinFormVisible ? (
+            <button
+              id="login-jellyfin-method"
+              type="button"
+              onClick={() => setActiveMethod("jellyfin")}
+              disabled={anySubmitting}
+              aria-controls="jellyfin-login-form"
+              aria-expanded={false}
+              className={AUTH_SECONDARY_BUTTON_CLASS}
+            >
+              <img
+                src="/auth-providers/jellyfin.svg"
+                alt=""
+                aria-hidden="true"
+                className="h-4 w-4"
+              />
+              {t("auth.signInWithJellyfin")}
+            </button>
+          ) : null}
+
+          {embyLoginAvailable && showLoginMethodChooser && !embyFormVisible ? (
+            <button
+              id="login-emby-method"
+              type="button"
+              onClick={() => setActiveMethod("emby")}
+              disabled={anySubmitting}
+              aria-controls="emby-login-form"
+              aria-expanded={false}
+              className={AUTH_SECONDARY_BUTTON_CLASS}
+            >
+              <img
+                src="/auth-providers/emby.svg"
+                alt=""
+                aria-hidden="true"
+                className="h-4 w-4"
+              />
+              Sign in with Emby
+            </button>
+          ) : null}
+
+          {passkeyEnabled ? (
+            <button
+              id="login-passkey-submit"
+              type="button"
+              onClick={handlePasskeySignIn}
+              disabled={anySubmitting}
+              className={AUTH_SECONDARY_BUTTON_CLASS}
+            >
+              {passkeySubmitting ? (
+                <LoadingMark className="h-4 w-4" />
+              ) : (
+                <Fingerprint className="h-4 w-4" aria-hidden="true" />
+              )}
+              {passkeySubmitting ? t("auth.passkeySigningIn") : "Sign in with a passkey"}
+            </button>
           ) : null}
 
           {plexLoginAvailable ? (
