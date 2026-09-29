@@ -28,7 +28,7 @@ use serde::Serialize;
 use super::act::{ListActions, act_on_candidate};
 use super::evaluate::{ItemDecision, count_states, edited_since_last_sync, evaluate};
 use super::fetch::{ListChartSource, ListFailure, ListFailureClass, fetch_list};
-use super::leave::{handle_departures, has_runnable_leave_action};
+use super::leave::{LeaveReport, handle_departures, has_runnable_leave_action};
 use super::plugin::ListPluginProvider;
 use super::ports::{
     ListExclusionRepository, ListMembershipRepository, ListSubscriptionRepository,
@@ -80,7 +80,8 @@ pub enum SubscriptionSyncOutcome {
         departures_acted: u64,
     },
     Unchanged,
-    /// The owner's list policy is off; nothing was read.
+    /// The owner's list policy is off and nothing was read, or the list was
+    /// unfollowed while it synced and nothing more was done.
     Off,
     Failed(ListFailure),
 }
@@ -332,6 +333,9 @@ pub async fn sync_subscription(
     let hold_requests = owner_policy == Some(ListPolicy::Approval);
     let mut rows = Vec::with_capacity(evaluated.len());
     let mut acted_states = Vec::new();
+    // Set once the list is found disabled mid-sync: no further add, request
+    // or on-leave action runs for it.
+    let mut stopped = false;
     for evaluated in evaluated {
         let previous = existing.get(&evaluated.item.item.item_key);
         let mut row = membership_row(subscription, &evaluated.item, previous, now);
@@ -355,6 +359,19 @@ pub async fn sync_subscription(
             ItemDecision::Unresolved => row.state = ListMembershipState::Unresolved,
             ItemDecision::Deferred => row.state = ListMembershipState::Pending,
             ItemDecision::Candidate => {
+                if !stopped {
+                    match subscription_standing(context, &subscription.id).await? {
+                        SubscriptionStanding::Active => {}
+                        SubscriptionStanding::Disabled => stopped = true,
+                        SubscriptionStanding::Gone => return Ok(SubscriptionSyncOutcome::Off),
+                    }
+                }
+                if stopped {
+                    // Left for the sync after the list is enabled again.
+                    row.state = ListMembershipState::Pending;
+                    rows.push(row);
+                    continue;
+                }
                 let outcome = act_on_candidate(
                     context.actions,
                     subscription,
@@ -386,13 +403,24 @@ pub async fn sync_subscription(
         .memberships
         .mark_left(&subscription.id, now, now)
         .await?;
-    let leave = handle_departures(
-        subscription,
-        context.memberships,
-        context.subscriptions,
-        context.actions,
-    )
-    .await?;
+    if !stopped {
+        match subscription_standing(context, &subscription.id).await? {
+            SubscriptionStanding::Active => {}
+            SubscriptionStanding::Disabled => stopped = true,
+            SubscriptionStanding::Gone => return Ok(SubscriptionSyncOutcome::Off),
+        }
+    }
+    let leave = if stopped {
+        LeaveReport::default()
+    } else {
+        handle_departures(
+            subscription,
+            context.memberships,
+            context.subscriptions,
+            context.actions,
+        )
+        .await?
+    };
 
     let counts = count_states(rows.iter().map(|row| row.state));
     let status = ListSyncStatus {
@@ -414,6 +442,27 @@ pub async fn sync_subscription(
         acted: count_states(acted_states),
         departures_acted: leave.acted,
     })
+}
+
+/// Whether a list may still act, read again from the store: a sync runs long
+/// enough for its list to be disabled or unfollowed underneath it.
+enum SubscriptionStanding {
+    Active,
+    Disabled,
+    Gone,
+}
+
+async fn subscription_standing(
+    context: &ListSyncContext<'_>,
+    subscription_id: &str,
+) -> AppResult<SubscriptionStanding> {
+    Ok(
+        match context.subscriptions.get_by_id(subscription_id).await? {
+            Some(current) if current.enabled => SubscriptionStanding::Active,
+            Some(_) => SubscriptionStanding::Disabled,
+            None => SubscriptionStanding::Gone,
+        },
+    )
 }
 
 fn membership_row(

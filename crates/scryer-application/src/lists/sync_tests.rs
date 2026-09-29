@@ -1202,3 +1202,45 @@ async fn a_sync_nobody_raced_moves_the_next_sync_on() {
         Some(at(401) + chrono::Duration::hours(6))
     );
 }
+
+#[tokio::test]
+async fn a_list_disabled_while_it_syncs_takes_no_further_action() {
+    let mut list = subscription("list-a");
+    list.on_leave = ListOnLeave::Unmonitor;
+    let harness = Harness::new(vec![list]);
+    harness.lists.serve("list-a", &["alpha"]);
+    harness.sync_at(at(0)).await;
+    let read = harness.store.subscription("list-a");
+    let calls_before = harness.actions.calls().len();
+    // Disabled after this sync read the list; alpha left and beta is new.
+    for row in harness.store.subscriptions.lock().unwrap().iter_mut() {
+        row.enabled = false;
+    }
+    harness.lists.serve("list-a", &["beta"]);
+
+    harness.sync_one_at(&read, at(10)).await;
+
+    assert_eq!(
+        harness.actions.calls().len(),
+        calls_before,
+        "nothing is added and no on-leave action runs"
+    );
+    assert_eq!(
+        harness.store.row("list-a", "beta").state,
+        ListMembershipState::Pending,
+        "the new item waits for the list to be enabled again"
+    );
+    assert!(!harness.store.row("list-a", "alpha").left_handled);
+}
+
+#[tokio::test]
+async fn a_list_unfollowed_while_it_syncs_takes_no_action() {
+    let harness = Harness::new(Vec::new());
+    harness.lists.serve("list-a", &["alpha"]);
+
+    let outcome = harness.sync_one_at(&subscription("list-a"), at(0)).await;
+
+    assert_eq!(outcome, SubscriptionSyncOutcome::Off);
+    assert!(harness.actions.calls().is_empty());
+    assert!(harness.store.rows("list-a").is_empty());
+}
