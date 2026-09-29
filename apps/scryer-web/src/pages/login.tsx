@@ -158,7 +158,7 @@ const AUTH_ERROR_CLASS =
 /// every unauthenticated visitor loads. At 256 CSS px the 512px source is still
 /// pixel-doubled on retina.
 ///
-/// Only one wordmark asset exists and its letterforms are light ink for a dark
+/// The wordmark letterforms are light ink for a dark
 /// background, so on the light theme it is darkened to stay legible. The theme
 /// is read after mount for the same reason the sidebar does it: `resolvedTheme`
 /// is undefined on the first pass and the mark would otherwise flip after paint.
@@ -180,7 +180,7 @@ function AuthBrand() {
       />
       <img
         id="login-brand-wordmark"
-        src={`${import.meta.env.BASE_URL}scryer-wordmark.svg`}
+        src={`${import.meta.env.BASE_URL}scryer-wordmark-simple.svg`}
         alt="Scryer"
         className={cn(
           "h-auto w-56 max-w-full",
@@ -1238,18 +1238,14 @@ export default function LoginPage() {
         <div className="space-y-3">
           {localPasswordAvailable ? (
             <>
-              {showLoginMethodChooser ? (
+              {showLoginMethodChooser && !passwordFormVisible ? (
                 <button
                   id="login-password-method"
                   type="button"
-                  onClick={() =>
-                    setActiveMethod((current) =>
-                      current === "password" ? null : "password",
-                    )
-                  }
+                  onClick={() => setActiveMethod("password")}
                   disabled={anySubmitting}
                   aria-controls="login-form"
-                  aria-expanded={activeMethod === "password"}
+                  aria-expanded={false}
                   className={AUTH_SECONDARY_BUTTON_CLASS}
                 >
                   <KeyRound className="h-4 w-4" aria-hidden="true" />
