@@ -29,6 +29,8 @@ const MAX_PLUGIN_OUTPUT_FILES: usize = 20_000;
 const MAX_PLUGIN_OUTPUT_DIRECTORIES: usize = 20_000;
 const MAX_PLUGIN_OUTPUT_ENTRIES: usize = MAX_PLUGIN_OUTPUT_FILES + MAX_PLUGIN_OUTPUT_DIRECTORIES;
 const MAX_PLUGIN_OUTPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_DISCOVERY_DEPTH: usize = 3;
+const MAX_ARCHIVE_DISCOVERY_DIRECTORIES: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct ArchiveExtractionDestination {
@@ -625,10 +627,66 @@ fn has_importable_video_files(dir: &Path, is_sample: fn(&Path) -> bool) -> bool 
     false
 }
 
-/// Find the primary archive file in a directory. Prefers RAR, then 7z, then zip.
+/// Find the primary archive file of a download: the first directory holding an
+/// archive, searched top level first and then subdirectories breadth-first in
+/// name order, and within it the first set of the preferred type.
 fn find_primary_archive(dir: &Path) -> Option<(PathBuf, ArchiveType)> {
+    archive_discovery_dirs(dir)
+        .iter()
+        .find_map(|dir| archive_sets_in_dir(dir).into_iter().next())
+}
+
+/// The download root followed by its subdirectories, breadth-first in name
+/// order, at most `MAX_ARCHIVE_DISCOVERY_DEPTH` levels deep. Sample folders,
+/// hidden folders and Scryer's own staging folders are never searched, and
+/// symlinked directories are not followed.
+fn archive_discovery_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![dir.to_path_buf()];
+    let mut frontier = vec![dir.to_path_buf()];
+    for _ in 0..MAX_ARCHIVE_DISCOVERY_DEPTH {
+        let mut next = Vec::new();
+        for parent in &frontier {
+            let Ok(entries) = std::fs::read_dir(parent) else {
+                continue;
+            };
+            let mut children: Vec<PathBuf> = entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .map(|entry| entry.path())
+                .filter(|path| !is_excluded_archive_discovery_dir(path))
+                .collect();
+            children.sort();
+            next.extend(children);
+        }
+        next.truncate(MAX_ARCHIVE_DISCOVERY_DIRECTORIES.saturating_sub(dirs.len()));
+        if next.is_empty() {
+            break;
+        }
+        dirs.extend(next.iter().cloned());
+        frontier = next;
+    }
+    dirs
+}
+
+fn is_excluded_archive_discovery_dir(path: &Path) -> bool {
+    if is_archive_staging_dir(path) {
+        return true;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_none_or(|name| {
+            name.starts_with('.')
+                || name.eq_ignore_ascii_case("sample")
+                || name.eq_ignore_ascii_case("samples")
+        })
+}
+
+/// The archive sets directly inside `dir`, each named by its first volume.
+/// Only the preferred archive type present is considered (RAR, then 7z, then
+/// zip); RAR volumes of one set collapse onto their first volume.
+fn archive_sets_in_dir(dir: &Path) -> Vec<(PathBuf, ArchiveType)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return None;
+        return Vec::new();
     };
 
     let mut rar = Vec::new();
@@ -648,17 +706,26 @@ fn find_primary_archive(dir: &Path) -> Option<(PathBuf, ArchiveType)> {
         }
     }
 
-    rar.sort_by_key(|path| rar_selection_key(path));
-    sevenz.sort();
-    zip.sort();
-
-    if let Some(p) = rar.into_iter().next() {
-        Some((p, ArchiveType::Rar))
-    } else if let Some(p) = sevenz.into_iter().next() {
-        Some((p, ArchiveType::SevenZip))
-    } else {
-        zip.into_iter().next().map(|p| (p, ArchiveType::Zip))
+    if !rar.is_empty() {
+        rar.sort_by_key(|path| rar_selection_key(path));
+        let mut sets: Vec<(PathBuf, ArchiveType)> = Vec::new();
+        let mut last_group: Option<String> = None;
+        for path in rar {
+            let (group, _, _) = rar_selection_key(&path);
+            if last_group.as_ref() != Some(&group) {
+                last_group = Some(group);
+                sets.push((path, ArchiveType::Rar));
+            }
+        }
+        return sets;
     }
+    let (mut paths, archive_type) = if !sevenz.is_empty() {
+        (sevenz, ArchiveType::SevenZip)
+    } else {
+        (zip, ArchiveType::Zip)
+    };
+    paths.sort();
+    paths.into_iter().map(|path| (path, archive_type)).collect()
 }
 
 fn archive_type_for_path(path: &Path) -> Option<ArchiveType> {
@@ -952,6 +1019,112 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("movie.mkv"), b"video").unwrap();
         assert!(find_primary_archive(dir.path()).is_none());
+    }
+
+    #[test]
+    fn find_primary_archive_finds_a_set_in_a_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("Lantern.Vale.2019.1080p.BluRay-NOGRP");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("lantern.vale.part02.rar"), b"rar").unwrap();
+        fs::write(nested.join("lantern.vale.part01.rar"), b"rar").unwrap();
+        fs::write(dir.path().join("lantern.vale.nfo"), b"nfo").unwrap();
+
+        let (path, kind) = find_primary_archive(dir.path()).unwrap();
+
+        assert!(matches!(kind, ArchiveType::Rar));
+        assert_eq!(path, nested.join("lantern.vale.part01.rar"));
+    }
+
+    #[test]
+    fn find_primary_archive_prefers_the_top_level_over_subdirectories() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("Extras");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("extras.rar"), b"rar").unwrap();
+        fs::write(dir.path().join("lantern.vale.zip"), b"zip").unwrap();
+
+        let (path, kind) = find_primary_archive(dir.path()).unwrap();
+
+        assert!(matches!(kind, ArchiveType::Zip));
+        assert_eq!(path, dir.path().join("lantern.vale.zip"));
+    }
+
+    #[test]
+    fn find_primary_archive_searches_subdirectories_in_name_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for (folder, archive) in [("CD2", "vale.cd2.rar"), ("CD1", "vale.cd1.rar")] {
+            let nested = dir.path().join(folder);
+            fs::create_dir(&nested).unwrap();
+            fs::write(nested.join(archive), b"rar").unwrap();
+        }
+
+        let (path, _) = find_primary_archive(dir.path()).unwrap();
+
+        assert_eq!(path, dir.path().join("CD1").join("vale.cd1.rar"));
+    }
+
+    #[test]
+    fn find_primary_archive_skips_sample_hidden_and_staging_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        for folder in [
+            "Sample",
+            "samples",
+            ".hidden",
+            EXTRACTED_DIR_NAME,
+            &format!("{ARCHIVE_STAGING_PREFIX}0123456789abcdef"),
+        ] {
+            let nested = dir.path().join(folder);
+            fs::create_dir(&nested).unwrap();
+            fs::write(nested.join("vale.rar"), b"rar").unwrap();
+        }
+
+        assert!(find_primary_archive(dir.path()).is_none());
+    }
+
+    #[test]
+    fn find_primary_archive_stops_at_the_depth_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut within = dir.path().to_path_buf();
+        for level in 0..MAX_ARCHIVE_DISCOVERY_DEPTH {
+            within = within.join(format!("level{level}"));
+        }
+        let beyond = within.join("too-deep");
+        fs::create_dir_all(&beyond).unwrap();
+        fs::write(beyond.join("vale.rar"), b"rar").unwrap();
+
+        assert!(find_primary_archive(dir.path()).is_none());
+
+        fs::write(within.join("vale.7z"), b"7z").unwrap();
+        let (path, kind) = find_primary_archive(dir.path()).unwrap();
+        assert!(matches!(kind, ArchiveType::SevenZip));
+        assert_eq!(path, within.join("vale.7z"));
+    }
+
+    #[test]
+    fn archive_sets_in_dir_collapses_rar_volumes_onto_each_first_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "vale.part02.rar",
+            "vale.part01.rar",
+            "harbor.rar",
+            "harbor.r00",
+            "extras.7z",
+        ] {
+            fs::write(dir.path().join(name), b"archive").unwrap();
+        }
+
+        let sets = archive_sets_in_dir(dir.path());
+
+        let names: Vec<_> = sets
+            .iter()
+            .map(|(path, _)| path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["harbor.rar", "vale.part01.rar"]);
+        assert!(
+            sets.iter()
+                .all(|(_, kind)| matches!(kind, ArchiveType::Rar))
+        );
     }
 
     /// A scene-style release folder: an old-style RAR set, its nfo/sfv, and a
