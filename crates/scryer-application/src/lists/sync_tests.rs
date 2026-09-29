@@ -337,6 +337,22 @@ async fn a_rate_limit_pauses_until_retry_after_capped_at_a_day() {
 }
 
 #[tokio::test]
+async fn a_sync_reports_only_the_adds_it_made() {
+    let mut list = subscription("list-a");
+    list.interval_seconds = 60;
+    let harness = Harness::new(vec![list]);
+    harness.lists.serve("list-a", &["alpha", "beta"]);
+    harness.sync_at(at(0)).await;
+    harness.lists.serve("list-a", &["alpha", "beta", "gamma"]);
+
+    let report = harness.sync_at(at(10)).await;
+
+    assert_eq!(report.synced, 1);
+    assert_eq!(report.added, 1, "only gamma was added by this sync");
+    assert_eq!(harness.store.subscription("list-a").counts.added, 3);
+}
+
+#[tokio::test]
 async fn an_unchanged_list_touches_only_its_timestamps() {
     let mut list = subscription("list-a");
     list.interval_seconds = 60;

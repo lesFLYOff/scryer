@@ -74,7 +74,9 @@ pub struct ListSyncContext<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubscriptionSyncOutcome {
     Synced {
-        counts: ListCounts,
+        /// The outcomes of the adds and requests this sync made. Items an
+        /// earlier sync settled are not in it.
+        acted: ListCounts,
         departures_acted: u64,
     },
     Unchanged,
@@ -186,13 +188,13 @@ async fn sync_one_due(
     };
     match outcome {
         SubscriptionSyncOutcome::Synced {
-            counts,
+            acted,
             departures_acted,
         } => {
             report.synced += 1;
-            report.added += counts.added;
-            report.requested += counts.requested;
-            report.held += counts.held;
+            report.added += acted.added;
+            report.requested += acted.requested;
+            report.held += acted.held;
             report.departures_acted += departures_acted;
         }
         SubscriptionSyncOutcome::Unchanged => report.unchanged += 1,
@@ -329,6 +331,7 @@ pub async fn sync_subscription(
     // review, whatever their grants and the request rules would allow.
     let hold_requests = owner_policy == Some(ListPolicy::Approval);
     let mut rows = Vec::with_capacity(evaluated.len());
+    let mut acted_states = Vec::new();
     for evaluated in evaluated {
         let previous = existing.get(&evaluated.item.item.item_key);
         let mut row = membership_row(subscription, &evaluated.item, previous, now);
@@ -359,6 +362,7 @@ pub async fn sync_subscription(
                     hold_requests,
                 )
                 .await;
+                acted_states.push(outcome.state);
                 row.state = outcome.state;
                 row.state_reason = outcome.reason;
                 row.added_by_list |= outcome.added_by_list;
@@ -407,7 +411,7 @@ pub async fn sync_subscription(
     run.counts = counts;
     finish_run(context, run, now).await?;
     Ok(SubscriptionSyncOutcome::Synced {
-        counts,
+        acted: count_states(acted_states),
         departures_acted: leave.acted,
     })
 }
@@ -551,7 +555,7 @@ async fn record_empty_fetch(
     run.error_message = Some(LIST_SYNC_EMPTY_FETCH_NOTE.to_string());
     finish_run(context, run, now).await?;
     Ok(SubscriptionSyncOutcome::Synced {
-        counts: ListCounts::default(),
+        acted: ListCounts::default(),
         departures_acted: 0,
     })
 }
