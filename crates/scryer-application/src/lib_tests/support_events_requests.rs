@@ -481,6 +481,8 @@ impl DomainEventRepository for MockDomainEventRepo {
 pub(super) struct MockMediaRequestRepo {
     pub(super) titles: Option<Arc<MockTitleRepo>>,
     pub(super) fail_policy_tag_rewrites: AtomicBool,
+    /// Stands in for a store failure while approving a request.
+    pub(super) fail_approvals: AtomicBool,
     pub(super) requests: Arc<Mutex<Vec<MediaRequest>>>,
     pub(super) domain_events: Option<Arc<MockDomainEventRepo>>,
 }
@@ -492,6 +494,7 @@ impl MockMediaRequestRepo {
             requests: Arc::new(Mutex::new(Vec::new())),
             domain_events: Some(domain_events),
             fail_policy_tag_rewrites: AtomicBool::new(false),
+            fail_approvals: AtomicBool::new(false),
         }
     }
 }
@@ -535,6 +538,11 @@ impl MediaRequestRepository for MockMediaRequestRepo {
         MediaRequestResolutionResult,
         Option<DomainEvent>,
     )> {
+        if self.fail_approvals.load(Ordering::SeqCst) {
+            return Err(AppError::Repository(
+                "synthetic request approval failure".into(),
+            ));
+        }
         let titles = self.titles.as_ref().expect("approval title store");
         let created = titles
             .create_or_get_existing_with_options_patch(title, options.clone())

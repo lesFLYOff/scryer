@@ -4329,8 +4329,7 @@ pub mod test_nulls {
         async fn find_by_external_id_in_facet(
             &self,
             _: MediaFacet,
-            _: &str,
-            _: &str,
+            _: &scryer_domain::ExternalId,
         ) -> AppResult<Option<Title>> {
             Ok(None)
         }
