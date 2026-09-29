@@ -8920,6 +8920,39 @@ pub trait IndexerClient: Send + Sync {
         ))
     }
 
+    /// Run one prepared strategy against this single indexer.
+    ///
+    /// The default forwards to [`Self::search`] and drops
+    /// `request.rss_catch_up`; an adapter that can hand the RSS catch-up
+    /// marker to its provider overrides this.
+    async fn search_strategy(
+        &self,
+        request: crate::IndexerSearchStrategyRequest,
+        mode: SearchMode,
+        operation: IndexerErrorOperation,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> AppResult<IndexerSearchResponse> {
+        self.search(
+            request.query,
+            request.ids,
+            request.category,
+            request.facet,
+            request.id_search_facet,
+            request.newznab_categories,
+            None,
+            mode,
+            operation,
+            request.season,
+            request.episode,
+            request.absolute_episode,
+            request.year,
+            request.tagged_aliases,
+            None,
+            cancel_token,
+        )
+        .await
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "indexer search forwards the full caller-controlled search envelope to plugins"
