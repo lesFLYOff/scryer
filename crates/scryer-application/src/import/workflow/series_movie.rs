@@ -412,11 +412,52 @@ async fn mark_import_extracting(app: &AppUseCase, import_id: &str) -> AppResult<
     .await
 }
 
+/// Password candidates for this download's archives, in the order they are
+/// tried after a password-free attempt is refused: the operator's retry
+/// password, the password the indexer announced for this grab, then one
+/// carried in the client-reported release or job name.
+///
+/// The stored password is looked up only for a Scryer grab, by its title and
+/// persisted release title, so it can only be the one announced for this
+/// release. A failed lookup costs that candidate, never the import.
+async fn archive_password_candidates(
+    app: &AppUseCase,
+    completed: &CompletedDownload,
+    release_evidence: &ReleaseEvidence,
+    operator_password: Option<&str>,
+) -> crate::import::archive_passwords::ArchivePasswordCandidates {
+    let mut candidates = crate::import::archive_passwords::ArchivePasswordCandidates::default();
+    candidates.push_operator(operator_password);
+    if let (Some(title_id), Some(source_title)) = (
+        release_evidence.title_id(),
+        release_evidence.submission_source_title(),
+    ) {
+        match app
+            .services
+            .workflow
+            .release_attempts
+            .get_latest_source_password(Some(title_id), None, Some(source_title))
+            .await
+        {
+            Ok(password) => candidates.push_indexer(password.as_deref()),
+            Err(error) => tracing::warn!(
+                error = %error,
+                title_id,
+                "failed to read the stored indexer archive password; continuing without it"
+            ),
+        }
+    }
+    candidates.push_release_name(completed.release_name.as_deref());
+    candidates.push_release_name(Some(&completed.name));
+    candidates
+}
+
 async fn try_match_titleless_archive_from_inner_video(
     app: &AppUseCase,
     import_id: &str,
     completed: &CompletedDownload,
     dest_dir: &Path,
+    release_evidence: &ReleaseEvidence,
     archive_password: Option<&str>,
     resolved_title_authorization: Option<&User>,
 ) -> AppResult<Option<TitlelessArchiveMatch>> {
@@ -430,6 +471,8 @@ async fn try_match_titleless_archive_from_inner_video(
         return Ok(None);
     };
 
+    let passwords =
+        archive_password_candidates(app, completed, release_evidence, archive_password).await;
     let archive_provider = app
         .services
         .integrations
@@ -449,7 +492,7 @@ async fn try_match_titleless_archive_from_inner_video(
             dest_dir,
             is_sample,
             Some(destination),
-            archive_password,
+            &passwords,
             archive_provider.clone(),
         )
         .await?
@@ -518,7 +561,7 @@ async fn try_match_titleless_archive_from_inner_video(
                             dest_dir,
                             is_sample,
                             Some(destination),
-                            archive_password,
+                            &passwords,
                             archive_provider.clone(),
                         )
                         .await?
@@ -613,6 +656,7 @@ async fn resolve_completed_import_target(
             import_id,
             completed,
             dest_dir,
+            release_evidence,
             archive_password,
             resolved_title_authorization,
         )
@@ -741,6 +785,11 @@ async fn resolve_completed_import_target(
         } else {
             None
         };
+        let passwords = if extraction_destination.is_some() {
+            archive_password_candidates(app, completed, release_evidence, archive_password).await
+        } else {
+            Default::default()
+        };
         if extraction_destination.is_some() {
             mark_import_extracting(app, import_id).await?;
         }
@@ -776,7 +825,7 @@ async fn resolve_completed_import_target(
                 dest_dir,
                 automatic_scan_sample_rule(&title.facet),
                 extraction_destination,
-                archive_password,
+                &passwords,
                 app.services
                     .integrations
                     .archive_extractor_plugin_provider

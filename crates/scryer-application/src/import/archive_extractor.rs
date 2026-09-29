@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use crate::import::archive_passwords::ArchivePasswordCandidates;
 use crate::{AppError, AppResult, ArchiveExtractorPluginProvider};
 use scryer_plugin_sdk::{
     ArchivePluginFormat, ArchivePluginOperation, ArchivePluginProcessRequest,
@@ -99,15 +100,19 @@ impl ArchiveType {
 ///
 /// `is_sample` is the sample rule the import scan will apply afterwards: a
 /// video it would discard does not make the download's archives redundant.
+///
+/// The first attempt never carries a password. Only when the plugin answers
+/// that the archive needs one (or that the one given is wrong) are the
+/// `passwords` candidates tried, in order, each in a fresh workspace; any other
+/// failure ends the attempts and is returned as it is.
 pub async fn extract_archives_if_needed(
     dir: &Path,
     is_sample: fn(&Path) -> bool,
     destination: Option<ArchiveExtractionDestination>,
-    password: Option<&str>,
+    passwords: &ArchivePasswordCandidates,
     archive_provider: Option<Arc<dyn ArchiveExtractorPluginProvider>>,
 ) -> AppResult<Option<PathBuf>> {
     let dir = dir.to_path_buf();
-    let password = password.map(|s| s.to_string());
     let archive = {
         let dir = dir.clone();
         tokio::task::spawn_blocking(move || plan_archive_extraction(&dir, is_sample))
@@ -124,7 +129,67 @@ pub async fn extract_archives_if_needed(
             dir.display()
         )));
     };
-    let workspace = ArchiveExtractionWorkspace::create(&destination).await?;
+
+    let attempt = |password: Option<&str>| {
+        extract_archive_attempt(
+            &dir,
+            &archive_path,
+            archive_type,
+            &destination,
+            password.map(str::to_string),
+            archive_provider.clone(),
+        )
+    };
+    let mut rejection = match attempt(None).await {
+        ArchiveAttempt::Finished(result) => return result,
+        ArchiveAttempt::PasswordRejected(error) => error,
+    };
+    for (index, candidate) in passwords.iter().enumerate() {
+        match attempt(Some(candidate.value())).await {
+            ArchiveAttempt::Finished(result) => {
+                if result.is_ok() {
+                    info!(
+                        password_source = candidate.source().as_str(),
+                        candidate = index + 1,
+                        candidates = passwords.len(),
+                        "archive password candidate accepted"
+                    );
+                }
+                return result;
+            }
+            ArchiveAttempt::PasswordRejected(error) => rejection = error,
+        }
+    }
+    if !passwords.is_empty() {
+        info!(
+            candidates = passwords.len(),
+            "no archive password candidate was accepted"
+        );
+    }
+    Err(rejection)
+}
+
+/// The outcome of one extraction attempt. A password rejection is the only
+/// outcome that lets the next password candidate be tried.
+enum ArchiveAttempt {
+    Finished(AppResult<Option<PathBuf>>),
+    PasswordRejected(AppError),
+}
+
+/// One extraction attempt in a workspace of its own. Whatever it does not
+/// hand back as the extraction result is cleaned up before it returns.
+async fn extract_archive_attempt(
+    dir: &Path,
+    archive_path: &Path,
+    archive_type: ArchiveType,
+    destination: &ArchiveExtractionDestination,
+    password: Option<String>,
+    archive_provider: Option<Arc<dyn ArchiveExtractorPluginProvider>>,
+) -> ArchiveAttempt {
+    let workspace = match ArchiveExtractionWorkspace::create(destination).await {
+        Ok(workspace) => workspace,
+        Err(error) => return ArchiveAttempt::Finished(Err(error)),
+    };
 
     info!(
         archive = %archive_path.display(),
@@ -136,9 +201,9 @@ pub async fn extract_archives_if_needed(
     let workspace_root = workspace.root.clone();
     let Some(provider) = archive_provider else {
         cleanup_extracted_dir(&workspace_root).await;
-        return Err(AppError::archive_extraction_plugin_required(Some(
+        return ArchiveAttempt::Finished(Err(AppError::archive_extraction_plugin_required(Some(
             dir.to_string_lossy().into_owned(),
-        )));
+        ))));
     };
 
     // The plugin owns PAR2: it is handed the archive's own directory as a
@@ -151,7 +216,7 @@ pub async fn extract_archives_if_needed(
         .to_path_buf();
     let extraction = extract_with_archive_plugin(ArchivePluginExtraction {
         source_dir,
-        archive_path,
+        archive_path: archive_path.to_path_buf(),
         archive_type,
         format: archive_plugin_format_for_type(archive_type),
         password,
@@ -161,14 +226,18 @@ pub async fn extract_archives_if_needed(
     .await;
 
     match extraction {
-        Ok(Some(_)) => Ok(Some(workspace_root)),
-        Ok(None) => {
+        ArchiveAttempt::Finished(Ok(Some(_))) => ArchiveAttempt::Finished(Ok(Some(workspace_root))),
+        ArchiveAttempt::Finished(Ok(None)) => {
             cleanup_extracted_dir(&workspace_root).await;
-            Ok(None)
+            ArchiveAttempt::Finished(Ok(None))
         }
-        Err(error) => {
+        ArchiveAttempt::Finished(Err(error)) => {
             cleanup_extracted_dir(&workspace_root).await;
-            Err(error)
+            ArchiveAttempt::Finished(Err(error))
+        }
+        ArchiveAttempt::PasswordRejected(error) => {
+            cleanup_extracted_dir(&workspace_root).await;
+            ArchiveAttempt::PasswordRejected(error)
         }
     }
 }
@@ -221,9 +290,7 @@ fn archive_plugin_format_for_type(archive_type: ArchiveType) -> ArchivePluginFor
     }
 }
 
-async fn extract_with_archive_plugin(
-    request: ArchivePluginExtraction,
-) -> AppResult<Option<PathBuf>> {
+async fn extract_with_archive_plugin(request: ArchivePluginExtraction) -> ArchiveAttempt {
     let ArchivePluginExtraction {
         source_dir,
         archive_path,
@@ -236,8 +303,8 @@ async fn extract_with_archive_plugin(
 
     let (client, operation) = {
         let Some(client) = provider.client_for_format(format) else {
-            return Err(AppError::archive_extraction_plugin_required(Some(
-                source_dir.to_string_lossy().into_owned(),
+            return ArchiveAttempt::Finished(Err(AppError::archive_extraction_plugin_required(
+                Some(source_dir.to_string_lossy().into_owned()),
             )));
         };
         let operation = ArchivePluginOperation::ExtractArchive {
@@ -249,8 +316,18 @@ async fn extract_with_archive_plugin(
         (client, operation)
     };
     let request = ArchivePluginProcessRequest { operation };
-    let response = client.process(request).await?;
-    handle_archive_plugin_response(archive_type, output_dir, response)
+    let response = match client.process(request).await {
+        Ok(response) => response,
+        Err(error) => return ArchiveAttempt::Finished(Err(error)),
+    };
+    let password_rejected = matches!(
+        response.status,
+        ArchivePluginStatus::PasswordRequired | ArchivePluginStatus::PasswordInvalid
+    );
+    match handle_archive_plugin_response(archive_type, output_dir, response) {
+        Err(error) if password_rejected => ArchiveAttempt::PasswordRejected(error),
+        result => ArchiveAttempt::Finished(result),
+    }
 }
 
 impl ArchiveExtractionWorkspace {
@@ -943,6 +1020,285 @@ mod tests {
         })
     }
 
+    fn operator_password(value: &str) -> ArchivePasswordCandidates {
+        let mut candidates = ArchivePasswordCandidates::default();
+        candidates.push_operator(Some(value));
+        candidates
+    }
+
+    /// One scripted plugin answer per extraction call.
+    enum PluginStep {
+        Extracts,
+        Answers(
+            ArchivePluginStatus,
+            Option<&'static str>,
+            Option<&'static str>,
+        ),
+        TimesOut,
+    }
+
+    /// Answers each call with the next scripted step and records the password
+    /// every call carried. Every call first writes a partial member into its
+    /// output directory, so leftovers from refused attempts would be visible.
+    struct SequencedArchiveClient {
+        steps: Mutex<std::collections::VecDeque<PluginStep>>,
+        passwords: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ArchiveExtractorClient for SequencedArchiveClient {
+        async fn process(
+            &self,
+            request: ArchivePluginProcessRequest,
+        ) -> AppResult<ArchivePluginProcessResponse> {
+            let ArchivePluginOperation::ExtractArchive {
+                output_dir,
+                password,
+                ..
+            } = request.operation
+            else {
+                panic!("expected an extract operation");
+            };
+            self.passwords.lock().unwrap().push(password);
+            let output_dir = PathBuf::from(output_dir);
+            fs::write(output_dir.join("partial.mkv"), b"partial").unwrap();
+            let step = self
+                .steps
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("the extractor made more plugin calls than scripted");
+            let (status, error_code, message, files) = match step {
+                PluginStep::Extracts => (
+                    ArchivePluginStatus::Ok,
+                    None,
+                    None,
+                    vec![ArchivePluginExtractedFile {
+                        relative_path: "partial.mkv".to_string(),
+                        size: Some(7),
+                        checksum: None,
+                    }],
+                ),
+                PluginStep::Answers(status, error_code, message) => {
+                    (status, error_code, message, Vec::new())
+                }
+                PluginStep::TimesOut => {
+                    return Err(AppError::archive_extraction_timed_out(
+                        "archive plugin timed out after 3600 seconds".to_string(),
+                    ));
+                }
+            };
+            Ok(ArchivePluginProcessResponse {
+                status,
+                files,
+                expanded_bytes: None,
+                copied_bytes: None,
+                staged_bytes: None,
+                error_code: error_code.map(ToOwned::to_owned),
+                message: message.map(ToOwned::to_owned),
+            })
+        }
+    }
+
+    struct PasswordLoopRun {
+        result: AppResult<Option<PathBuf>>,
+        passwords: Vec<Option<String>>,
+        staging_dirs: usize,
+        staged_files: usize,
+    }
+
+    fn count_files(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() { count_files(&path) } else { 1 }
+            })
+            .sum()
+    }
+
+    async fn run_password_loop(
+        steps: Vec<PluginStep>,
+        candidates: &ArchivePasswordCandidates,
+    ) -> PasswordLoopRun {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("quiet.harbor.s02e03.rar"), b"rar").unwrap();
+        let passwords = Arc::new(Mutex::new(Vec::new()));
+        let client: Arc<dyn ArchiveExtractorClient> = Arc::new(SequencedArchiveClient {
+            steps: Mutex::new(steps.into()),
+            passwords: Arc::clone(&passwords),
+        });
+        let provider: Arc<dyn ArchiveExtractorPluginProvider> =
+            Arc::new(RecordingArchiveProvider {
+                client,
+                formats: vec![ArchivePluginFormat::Rar],
+            });
+
+        let result = extract_archives_if_needed(
+            source.path(),
+            is_sample_named_file,
+            Some(ArchiveExtractionDestination::new(
+                destination.path(),
+                "password-loop",
+            )),
+            candidates,
+            Some(provider),
+        )
+        .await;
+
+        let staging_dirs = fs::read_dir(destination.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| is_archive_staging_dir(&entry.path()))
+            .count();
+        let staged_files = count_files(destination.path());
+        assert!(source.path().join("quiet.harbor.s02e03.rar").exists());
+        let passwords = passwords.lock().unwrap().clone();
+        PasswordLoopRun {
+            result,
+            passwords,
+            staging_dirs,
+            staged_files,
+        }
+    }
+
+    fn operator_indexer_and_name_candidates() -> ArchivePasswordCandidates {
+        let mut candidates = ArchivePasswordCandidates::default();
+        candidates.push_operator(Some("typed-guess"));
+        candidates.push_indexer(Some("indexer-secret"));
+        candidates.push_release_name(Some("Quiet.Harbor.S02E03{{name-secret}}"));
+        candidates
+    }
+
+    #[tokio::test]
+    async fn password_free_success_makes_exactly_one_plugin_call() {
+        let run = run_password_loop(
+            vec![PluginStep::Extracts],
+            &operator_indexer_and_name_candidates(),
+        )
+        .await;
+
+        assert!(run.result.unwrap().is_some());
+        assert_eq!(run.passwords, [None]);
+        assert_eq!(run.staging_dirs, 1);
+    }
+
+    #[tokio::test]
+    async fn password_candidates_are_tried_in_order_until_one_is_accepted() {
+        let run = run_password_loop(
+            vec![
+                PluginStep::Answers(ArchivePluginStatus::PasswordRequired, None, None),
+                PluginStep::Answers(ArchivePluginStatus::PasswordInvalid, None, None),
+                PluginStep::Extracts,
+            ],
+            &operator_indexer_and_name_candidates(),
+        )
+        .await;
+
+        assert!(
+            run.result.unwrap().is_some(),
+            "the indexer password opens it"
+        );
+        assert_eq!(
+            run.passwords,
+            [
+                None,
+                Some("typed-guess".to_string()),
+                Some("indexer-secret".to_string()),
+            ]
+        );
+        // Refused attempts left nothing behind: only the accepted workspace
+        // remains, holding only its own output.
+        assert_eq!(run.staging_dirs, 1);
+        assert_eq!(run.staged_files, 1);
+    }
+
+    #[tokio::test]
+    async fn a_non_password_failure_on_a_candidate_stops_the_loop_and_is_reported() {
+        let run = run_password_loop(
+            vec![
+                PluginStep::Answers(ArchivePluginStatus::PasswordRequired, None, None),
+                PluginStep::Answers(
+                    ArchivePluginStatus::Failed,
+                    Some("archive_corrupt"),
+                    Some("bad block in volume 3"),
+                ),
+                PluginStep::Extracts,
+            ],
+            &operator_indexer_and_name_candidates(),
+        )
+        .await;
+
+        let error = run.result.unwrap_err();
+        assert!(matches!(error, AppError::Repository(_)), "{error:?}");
+        assert!(error.to_string().contains("archive_corrupt"), "{error}");
+        assert!(!is_password_required_error(&error), "{error}");
+        assert_eq!(run.passwords.len(), 2);
+        assert_eq!(run.staging_dirs, 0);
+        assert_eq!(run.staged_files, 0);
+    }
+
+    #[tokio::test]
+    async fn a_timeout_without_a_password_is_never_retried_with_candidates() {
+        let run = run_password_loop(
+            vec![PluginStep::TimesOut],
+            &operator_indexer_and_name_candidates(),
+        )
+        .await;
+
+        let error = run.result.unwrap_err();
+        assert!(is_timeout_error(&error), "{error:?}");
+        assert_eq!(run.passwords, [None]);
+        assert_eq!(run.staging_dirs, 0);
+        assert_eq!(run.staged_files, 0);
+    }
+
+    #[tokio::test]
+    async fn every_candidate_refused_keeps_the_password_prompt_flow() {
+        let run = run_password_loop(
+            vec![
+                PluginStep::Answers(ArchivePluginStatus::PasswordRequired, None, None),
+                PluginStep::Answers(ArchivePluginStatus::PasswordInvalid, None, None),
+                PluginStep::Answers(ArchivePluginStatus::PasswordInvalid, None, None),
+                PluginStep::Answers(ArchivePluginStatus::PasswordInvalid, None, None),
+            ],
+            &operator_indexer_and_name_candidates(),
+        )
+        .await;
+
+        let error = run.result.unwrap_err();
+        assert!(is_password_required_error(&error), "{error:?}");
+        let text = error.to_string();
+        for secret in ["typed-guess", "indexer-secret", "name-secret"] {
+            assert!(!text.contains(secret), "{text}");
+        }
+        assert_eq!(run.passwords.len(), 4);
+        assert_eq!(run.staging_dirs, 0);
+        assert_eq!(run.staged_files, 0);
+    }
+
+    #[tokio::test]
+    async fn without_candidates_a_password_prompt_is_returned_after_one_call() {
+        let run = run_password_loop(
+            vec![PluginStep::Answers(
+                ArchivePluginStatus::PasswordRequired,
+                None,
+                None,
+            )],
+            &ArchivePasswordCandidates::default(),
+        )
+        .await;
+
+        let error = run.result.unwrap_err();
+        assert!(is_password_required_error(&error), "{error:?}");
+        assert!(error.to_string().contains("requires a password"), "{error}");
+        assert_eq!(run.passwords, [None]);
+        assert_eq!(run.staging_dirs, 0);
+        assert_eq!(run.staged_files, 0);
+    }
+
     #[test]
     fn has_video_files_detects_mkv() {
         let dir = tempfile::tempdir().unwrap();
@@ -1241,7 +1597,7 @@ mod tests {
                 destination.path(),
                 "sample-only-release",
             )),
-            None,
+            &ArchivePasswordCandidates::default(),
             Some(provider),
         )
         .await
@@ -1283,9 +1639,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("movie.mkv"), b"video").unwrap();
         fs::write(dir.path().join("archive.rar"), b"rar").unwrap();
-        let result = extract_archives_if_needed(dir.path(), is_sample_named_file, None, None, None)
-            .await
-            .unwrap();
+        let result = extract_archives_if_needed(
+            dir.path(),
+            is_sample_named_file,
+            None,
+            &ArchivePasswordCandidates::default(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(result.is_none());
     }
 
@@ -1302,7 +1664,7 @@ mod tests {
                 destination.path(),
                 "rar-plugin-required",
             )),
-            None,
+            &ArchivePasswordCandidates::default(),
             None,
         )
         .await
@@ -1326,7 +1688,7 @@ mod tests {
                 destination.path(),
                 "7z-plugin-required",
             )),
-            None,
+            &ArchivePasswordCandidates::default(),
             None,
         )
         .await
@@ -1360,7 +1722,7 @@ mod tests {
                 destination.path(),
                 "7z-provider-missing-format",
             )),
-            None,
+            &ArchivePasswordCandidates::default(),
             Some(provider),
         )
         .await
@@ -1401,7 +1763,7 @@ mod tests {
                 destination.path(),
                 "7z-plain-extract",
             )),
-            None,
+            &ArchivePasswordCandidates::default(),
             Some(provider),
         )
         .await
@@ -1454,7 +1816,7 @@ mod tests {
                 destination.path(),
                 "zip-plain-extract",
             )),
-            None,
+            &ArchivePasswordCandidates::default(),
             Some(provider),
         )
         .await
@@ -1490,9 +1852,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("release.rar"), b"rar").unwrap();
 
-        let error = extract_archives_if_needed(dir.path(), is_sample_named_file, None, None, None)
-            .await
-            .unwrap_err();
+        let error = extract_archives_if_needed(
+            dir.path(),
+            is_sample_named_file,
+            None,
+            &ArchivePasswordCandidates::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1525,7 +1893,7 @@ mod tests {
                 destination.path(),
                 "import/with spaces",
             )),
-            Some("secret"),
+            &operator_password("secret"),
             Some(provider),
         )
         .await
@@ -1562,7 +1930,9 @@ mod tests {
                 );
                 assert_eq!(format, ArchivePluginFormat::Rar);
                 assert_eq!(recorded_archive, archive_path.to_string_lossy());
-                assert_eq!(password.as_deref(), Some("secret"));
+                // The archive opened without one, so the operator password
+                // was never sent.
+                assert_eq!(password, None);
             }
             other => panic!("expected extract operation, got {other:?}"),
         }
@@ -1667,7 +2037,7 @@ mod tests {
                 destination.path(),
                 "par2-plain-files",
             )),
-            None,
+            &ArchivePasswordCandidates::default(),
             Some(provider),
         )
         .await
@@ -1711,7 +2081,7 @@ mod tests {
                 destination.path(),
                 "par2-insufficient",
             )),
-            None,
+            &ArchivePasswordCandidates::default(),
             Some(provider),
         )
         .await
