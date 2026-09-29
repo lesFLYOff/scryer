@@ -1957,11 +1957,13 @@ pub trait TitleRepository: Send + Sync {
         }
     }
     async fn find_by_external_id(&self, source: &str, value: &str) -> AppResult<Option<Title>>;
+    /// A title of `facet` carrying `id`. A kinded `id` never matches a title
+    /// whose id of the same source and value names a different kind; an id
+    /// without a kind, on either side, matches any kind.
     async fn find_by_external_id_in_facet(
         &self,
         facet: MediaFacet,
-        source: &str,
-        value: &str,
+        id: &ExternalId,
     ) -> AppResult<Option<Title>>;
     async fn find_by_external_id_in_library_and_facet(
         &self,

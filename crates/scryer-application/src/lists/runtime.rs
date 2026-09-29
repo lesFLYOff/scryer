@@ -334,7 +334,7 @@ impl ListLibraryLookup for AppListLibraryLookup<'_> {
                 .services
                 .catalog
                 .titles
-                .find_by_external_id_in_facet(kind.clone(), &id.source, &id.value)
+                .find_by_external_id_in_facet(kind.clone(), id)
                 .await?
             {
                 return Ok(Some(title.id));

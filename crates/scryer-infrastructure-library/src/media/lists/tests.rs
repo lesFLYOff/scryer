@@ -659,6 +659,68 @@ async fn exclusions_match_by_id_kind_and_scope() {
     );
 }
 
+#[tokio::test]
+async fn exclusions_keep_id_kinds_and_match_only_compatible_kinds() {
+    let store = test_store(None).await;
+    let mut kinded = exclusion("kinded", ListExclusionScope::AllLists, &[]);
+    kinded.external_ids = vec![
+        ExternalId::with_kind("tmdb", "movie", "300"),
+        ExternalId::new("imdb", "tt300"),
+    ];
+    ListExclusionRepository::create(&store, kinded)
+        .await
+        .expect("kinded exclusion");
+    ListExclusionRepository::create(
+        &store,
+        exclusion("legacy", ListExclusionScope::AllLists, &[("tmdb", "400")]),
+    )
+    .await
+    .expect("kindless exclusion");
+
+    let stored = ListExclusionRepository::get_by_id(&store, "kinded")
+        .await
+        .unwrap()
+        .expect("stored exclusion");
+    assert!(
+        stored
+            .external_ids
+            .contains(&ExternalId::with_kind("tmdb", "movie", "300"))
+    );
+    assert!(
+        stored
+            .external_ids
+            .contains(&ExternalId::new("imdb", "tt300"))
+    );
+
+    let hits = |found: Vec<ListExclusion>| found.into_iter().map(|e| e.id).collect::<Vec<_>>();
+    let find = |id: ExternalId| {
+        let store = &store;
+        async move {
+            hits(
+                store
+                    .find_matching(MediaFacet::Movie, &[id], None)
+                    .await
+                    .unwrap(),
+            )
+        }
+    };
+    assert!(
+        find(ExternalId::with_kind("tmdb", "tv", "300"))
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        find(ExternalId::with_kind("tmdb", "movie", "300")).await,
+        vec!["kinded"]
+    );
+    assert_eq!(find(ExternalId::new("tmdb", "300")).await, vec!["kinded"]);
+    // An exclusion written without kinds keeps matching any kind.
+    assert_eq!(
+        find(ExternalId::with_kind("tmdb", "tv", "400")).await,
+        vec!["legacy"]
+    );
+}
+
 fn account(id: &str, user_id: &str) -> UserListAccount {
     let now = Utc::now();
     UserListAccount {
