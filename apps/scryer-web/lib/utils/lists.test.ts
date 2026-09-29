@@ -414,6 +414,7 @@ function settingField(overrides: Partial<ListProviderSettingField> = {}): ListPr
     secret: false,
     isSet: false,
     value: null,
+    options: [],
     ...overrides,
   };
 }
