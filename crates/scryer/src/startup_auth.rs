@@ -23,8 +23,9 @@ fn read_env(name: &str) -> Result<Option<String>, String> {
 fn bootstrap_bool(name: &str, value: Option<&str>) -> Result<bool, String> {
     match value {
         None => Ok(false),
-        Some(value) => super::parse_env_bool_value(value)
-            .ok_or_else(|| format!("{name} must be a valid boolean")),
+        Some(value) => super::parse_env_bool_value(value).ok_or_else(|| {
+            format!("{name} must be a valid boolean; omit the variable instead of leaving it blank")
+        }),
     }
 }
 
@@ -67,7 +68,7 @@ fn resolve_bootstrap_password(
 ) -> Result<Option<String>, String> {
     let password = if let Some(path) = file {
         if path.trim().is_empty() {
-            return Err("SCRYER_ADMIN_PASSWORD_FILE must name a readable secret file".into());
+            return Err("SCRYER_ADMIN_PASSWORD_FILE must name a readable secret file; omit the variable instead of leaving it blank".into());
         }
         Some(read_file(&path)?.trim_end_matches(['\r', '\n']).to_string())
     } else {
@@ -78,7 +79,7 @@ fn resolve_bootstrap_password(
         .is_some_and(|value| value.trim().is_empty())
     {
         return Err(
-            "SCRYER_ADMIN_PASSWORD or SCRYER_ADMIN_PASSWORD_FILE must contain a nonempty password"
+            "SCRYER_ADMIN_PASSWORD or SCRYER_ADMIN_PASSWORD_FILE must contain a nonempty password; omit the variables to leave bootstrap unconfigured"
                 .into(),
         );
     }

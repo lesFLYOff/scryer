@@ -31,6 +31,9 @@ test("keeps regional UI languages separate from generic Chinese metadata", () =>
   assert.equal(metadataLanguageForUi("zh-HK"), "zho");
   assert.equal(metadataLanguageForUi("zh-TW"), "zho");
   assert.equal(metadataLanguageForUi("eng"), "eng");
+  assert.equal(metadataLanguageForUi("EN_us"), "eng");
+  assert.equal(metadataLanguageForUi("pt-BR"), "por");
+  assert.equal(metadataLanguageForUi("unknown"), "eng");
   assert.deepEqual(METADATA_LANGUAGES.filter(({ code }) => code.startsWith("zh")), [
     { code: "zho", label: "中文" },
   ]);

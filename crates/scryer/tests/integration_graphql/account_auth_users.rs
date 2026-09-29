@@ -2885,6 +2885,33 @@ async fn tampered_token_is_rejected_by_authenticate_token() {
 }
 
 #[tokio::test]
+async fn bootstrap_admin_noop_preserves_saved_sign_in_settings() {
+    let ctx = TestContext::new().await;
+    seed_typed_settings_definitions(&ctx).await;
+    ctx.app
+        .bootstrap_admin_password("temporary-admin-secret")
+        .await
+        .unwrap();
+    for (key, value) in [
+        ("auth.form_login_enabled", "false"),
+        ("auth.skip_login_for_local_ips", "true"),
+    ] {
+        ctx.settings_store
+            .upsert_setting_value("system", key, None, value, "test", None)
+            .await
+            .unwrap();
+    }
+    let before = ctx.app.security_settings().await.unwrap();
+    assert!(!before.form_login_enabled);
+    assert!(before.skip_login_for_local_ips);
+    ctx.app
+        .bootstrap_admin_password("temporary-admin-secret")
+        .await
+        .unwrap();
+    assert_eq!(ctx.app.security_settings().await.unwrap(), before);
+}
+
+#[tokio::test]
 async fn bootstrap_admin_custom_account_disables_default_and_blocks_reenable() {
     let ctx = TestContext::new().await;
     seed_typed_settings_definitions(&ctx).await;
@@ -2942,6 +2969,15 @@ async fn bootstrap_admin_custom_account_disables_default_and_blocks_reenable() {
             .await
             .is_ok()
     );
+    assert!(ctx.app.find_or_create_default_user().await.is_err());
+    // Simulate a database where the default account is absent; startup policy still forbids recreation.
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(&admin.id)
+        .execute(ctx.db.pool())
+        .await
+        .unwrap();
+    assert!(ctx.app.find_or_create_default_user().await.is_err());
+    assert!(ctx.app.find_default_user().await.unwrap().is_none());
 }
 
 #[tokio::test]

@@ -269,6 +269,14 @@ impl AppUseCase {
     }
 
     async fn ensure_default_admin_actor(&self) -> AppResult<User> {
+        if self
+            .runtime
+            .security
+            .default_admin_disabled
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(AppError::Validation("admin is disabled by SCRYER_DISABLE_DEFAULT_ADMIN; remove that setting and restart before using the default administrator".into()));
+        }
         let username = DEFAULT_ADMIN_USERNAME;
         if let Some(found) = self
             .services
@@ -423,23 +431,31 @@ impl AppUseCase {
                 return Err(AppError::Validation("SCRYER_DISABLE_DEFAULT_ADMIN requires another enabled local full administrator with a usable password".into()));
             }
         }
-        // Persist the closed state first: an interrupted bootstrap must never reopen access.
-        for (key, value) in [
-            (crate::FORM_LOGIN_ENABLED_KEY, true),
-            (crate::SKIP_LOGIN_FOR_LOCAL_IPS_KEY, false),
-        ] {
-            self.services
-                .config
-                .settings
-                .upsert_setting_json(
-                    SETTINGS_SCOPE_SYSTEM,
-                    key,
-                    None,
-                    value.to_string(),
-                    "startup_bootstrap",
-                    None,
-                )
-                .await?;
+        let changes_credentials =
+            select_account && (reset || existing.is_none_or(|user| user.password_hash.is_none()));
+        let disables_enabled_admin = disable_default
+            && users.iter().any(|user| {
+                Self::is_default_admin_username(&user.username) && user.login_status().is_enabled()
+            });
+        // Persist the closed state before mutations, but preserve saved preferences on no-op boots.
+        if changes_credentials || disables_enabled_admin {
+            for (key, value) in [
+                (crate::FORM_LOGIN_ENABLED_KEY, true),
+                (crate::SKIP_LOGIN_FOR_LOCAL_IPS_KEY, false),
+            ] {
+                self.services
+                    .config
+                    .settings
+                    .upsert_setting_json(
+                        SETTINGS_SCOPE_SYSTEM,
+                        key,
+                        None,
+                        value.to_string(),
+                        "startup_bootstrap",
+                        None,
+                    )
+                    .await?;
+            }
         }
         if select_account {
             let user = if let Some(existing) = existing.filter(|_| !initialize_seed) {
@@ -520,13 +536,13 @@ impl AppUseCase {
             }
         }
         if disable_default {
-            let alternate = alternate.ok_or_else(|| {
+            alternate.ok_or_else(|| {
                 AppError::Validation(
                     "cannot disable admin without another usable administrator".into(),
                 )
             })?;
             if let Some(admin) = self.find_default_user().await? {
-                self.set_user_login_enabled(&alternate, &admin.id, false, true)
+                self.set_user_login_enabled_internal(None, &admin.id, false, true)
                     .await?;
                 self.revoke_oauth_refresh_grants_for_user(&admin.id, "user_login_disabled")
                     .await?;
@@ -1239,6 +1255,22 @@ impl AppUseCase {
         self.require_app_permission(actor, scryer_domain::AppPermission::ManageUsers)
             .await?;
 
+        self.set_user_login_enabled_internal(
+            Some(actor),
+            user_id,
+            enabled,
+            effective_form_login_enabled,
+        )
+        .await
+    }
+
+    async fn set_user_login_enabled_internal(
+        &self,
+        actor: Option<&User>,
+        user_id: &str,
+        enabled: bool,
+        effective_form_login_enabled: bool,
+    ) -> AppResult<User> {
         let user = self
             .services
             .identity
@@ -1256,7 +1288,7 @@ impl AppUseCase {
         {
             return Err(AppError::Validation("admin is disabled by SCRYER_DISABLE_DEFAULT_ADMIN; remove that setting and restart before enabling it".into()));
         }
-        if user.id == actor.id {
+        if actor.is_some_and(|actor| user.id == actor.id) {
             return Err(AppError::Validation(
                 "cannot change login status for the current user".into(),
             ));
@@ -1324,7 +1356,10 @@ impl AppUseCase {
             tracing::warn!(user_id, %error, "failed to revoke OAuth refresh grants after disabling user login");
         }
         self.emit_configuration_changed_event(
-            actor,
+            actor.map_or_else(
+                crate::DomainEventActor::system,
+                crate::DomainEventActor::user,
+            ),
             "user_login_status",
             Some(updated.id.clone()),
             ConfigurationChangeAction::Updated,

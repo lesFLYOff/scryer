@@ -116,7 +116,7 @@ export const METADATA_LANGUAGES: LanguageOption[] = AVAILABLE_LANGUAGES.filter(
 
 export function metadataLanguageForUi(code: string): string {
   const locale = normalizeLocale(code);
-  return locale === "zh-HK" || locale === "zh-TW" ? "zho" : code;
+  return locale === "zh-HK" || locale === "zh-TW" ? "zho" : locale;
 }
 
 export function getLanguageLabel(code: string): string {
