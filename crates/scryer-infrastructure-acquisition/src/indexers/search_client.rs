@@ -2273,21 +2273,75 @@ impl QueryBudgetLog {
 
 #[derive(Default)]
 struct IndexerRateLimiterState {
+    /// The earliest next slot each domain's dispatched requests left behind.
     next_request: HashMap<String, tokio::time::Instant>,
+    /// `(reservation id, next slot)` for every interval slot reserved but not
+    /// yet dispatched, so a dropped reservation can hand its spacing back.
+    pending_intervals: HashMap<String, Vec<(u64, tokio::time::Instant)>>,
     budgets: HashMap<String, QueryBudgetLog>,
     next_reservation_id: u64,
 }
 
-/// Releases a promised budget slot if the request that holds it is dropped
-/// before the slot comes, so a cancelled search does not spend the budget.
-struct QueryBudgetReservation {
+impl IndexerRateLimiterState {
+    /// The earliest moment a new interval slot may start for `domain_key`:
+    /// after every dispatched and every still-reserved slot.
+    fn interval_floor(&self, domain_key: &str) -> Option<tokio::time::Instant> {
+        let pending = self
+            .pending_intervals
+            .get(domain_key)
+            .and_then(|slots| slots.iter().map(|(_, next)| *next).max());
+        match (self.next_request.get(domain_key).copied(), pending) {
+            (Some(dispatched), Some(pending)) => Some(dispatched.max(pending)),
+            (dispatched, pending) => dispatched.or(pending),
+        }
+    }
+
+    fn forget_pending_interval(&mut self, domain_key: &str, id: u64) {
+        if let Some(slots) = self.pending_intervals.get_mut(domain_key) {
+            slots.retain(|(existing, _)| *existing != id);
+            if slots.is_empty() {
+                self.pending_intervals.remove(domain_key);
+            }
+        }
+    }
+}
+
+/// Gives a reserved slot back if the request that holds it is dropped before
+/// the slot comes, so a cancelled search spends neither the budget nor the
+/// interval spacing.
+struct PacingReservation {
     state: Arc<std::sync::Mutex<IndexerRateLimiterState>>,
     domain_key: String,
     id: u64,
+    budgeted: bool,
+    /// The next slot this reservation's interval spacing holds back, if the
+    /// domain is paced by an interval.
+    interval_next: Option<tokio::time::Instant>,
     dispatched: bool,
 }
 
-impl Drop for QueryBudgetReservation {
+impl PacingReservation {
+    /// The request is going out: its budget entry stays spent and its
+    /// interval spacing becomes permanent.
+    fn dispatch(&mut self) {
+        self.dispatched = true;
+        let Some(next) = self.interval_next else {
+            return;
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.forget_pending_interval(&self.domain_key, self.id);
+        let floor = state
+            .next_request
+            .entry(self.domain_key.clone())
+            .or_insert(next);
+        *floor = (*floor).max(next);
+    }
+}
+
+impl Drop for PacingReservation {
     fn drop(&mut self) {
         if self.dispatched {
             return;
@@ -2296,8 +2350,13 @@ impl Drop for QueryBudgetReservation {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(log) = state.budgets.get_mut(&self.domain_key) {
+        if self.budgeted
+            && let Some(log) = state.budgets.get_mut(&self.domain_key)
+        {
             log.release(self.id);
+        }
+        if self.interval_next.is_some() {
+            state.forget_pending_interval(&self.domain_key, self.id);
         }
     }
 }
@@ -2372,7 +2431,7 @@ impl IndexerRateLimiter {
 
         // The guard is built only after the lock is released: its `Drop`
         // relocks the same mutex, so an unwind inside the block must not drop it.
-        let (dispatch_at, reservation_id) = {
+        let reserved = {
             let now = tokio::time::Instant::now();
             let mut state = self
                 .state
@@ -2382,9 +2441,7 @@ impl IndexerRateLimiter {
                 now
             } else {
                 state
-                    .next_request
-                    .get(&pacing.domain_key)
-                    .copied()
+                    .interval_floor(&pacing.domain_key)
                     .unwrap_or(now)
                     .max(now)
             };
@@ -2411,28 +2468,33 @@ impl IndexerRateLimiter {
             if pacing.max_wait.is_some_and(|max_wait| wait > max_wait) {
                 return Err(PacingWaitExceeded { wait });
             }
-            let reservation_id = budget.map(|_| {
-                let id = state.next_reservation_id;
-                state.next_reservation_id += 1;
+            let id = state.next_reservation_id;
+            state.next_reservation_id += 1;
+            if budget.is_some() {
                 state
                     .budgets
                     .entry(pacing.domain_key.clone())
                     .or_default()
                     .promise(dispatch_at, id);
-                id
-            });
-            if !interval.is_zero() {
+            }
+            let interval_next = (!interval.is_zero()).then(|| {
                 let next_slot = dispatch_at.checked_add(interval).unwrap_or(dispatch_at);
                 state
-                    .next_request
-                    .insert(pacing.domain_key.clone(), next_slot);
-            }
-            (dispatch_at, reservation_id)
+                    .pending_intervals
+                    .entry(pacing.domain_key.clone())
+                    .or_default()
+                    .push((id, next_slot));
+                next_slot
+            });
+            (dispatch_at, id, budget.is_some(), interval_next)
         };
-        let reservation = reservation_id.map(|id| QueryBudgetReservation {
+        let (dispatch_at, id, budgeted, interval_next) = reserved;
+        let reservation = Some(PacingReservation {
             state: self.state.clone(),
             domain_key: pacing.domain_key.clone(),
             id,
+            budgeted,
+            interval_next,
             dispatched: false,
         });
         Ok(PacingSlot {
@@ -2445,7 +2507,7 @@ impl IndexerRateLimiter {
 /// One reserved pacing slot for one indexer request.
 struct PacingSlot {
     dispatch_at: tokio::time::Instant,
-    reservation: Option<QueryBudgetReservation>,
+    reservation: Option<PacingReservation>,
 }
 
 impl PacingSlot {
@@ -2454,7 +2516,7 @@ impl PacingSlot {
     async fn wait(mut self) {
         tokio::time::sleep_until(self.dispatch_at).await;
         if let Some(reservation) = self.reservation.as_mut() {
-            reservation.dispatched = true;
+            reservation.dispatch();
         }
     }
 }
@@ -15417,6 +15479,46 @@ mod tests {
         // Had the cancelled request kept its slot this one would wait until 70 s.
         let next = sequential_dispatches(&limiter, &pacing, 1, started_at).await;
         assert_dispatches(&next, &[60.0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pacing_gives_back_the_interval_slots_of_dropped_reservations() {
+        let limiter = IndexerRateLimiter::with_registry(RateLimitRegistry::isolated_indexers());
+        let pacing = test_pacing("interval-idx", 10);
+        let started_at = tokio::time::Instant::now();
+
+        let first = sequential_dispatches(&limiter, &pacing, 1, started_at).await;
+        assert_dispatches(&first, &[0.0]);
+
+        // Three strategies reserve the 10 s, 20 s and 30 s slots up front and
+        // are then cancelled before any of them goes out.
+        let reserved = (0..3)
+            .map(|_| limiter.reserve(&pacing).expect("an uncapped reservation"))
+            .collect::<Vec<_>>();
+        drop(reserved);
+
+        // Had the cancelled strategies kept their slots this would wait 40 s.
+        let next = sequential_dispatches(&limiter, &pacing, 2, started_at).await;
+        assert_dispatches(&next, &[10.0, 20.0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_reservation_between_live_ones_keeps_their_spacing() {
+        let limiter = IndexerRateLimiter::with_registry(RateLimitRegistry::isolated_indexers());
+        let pacing = test_pacing("interval-gap-idx", 10);
+        let started_at = tokio::time::Instant::now();
+
+        let first = limiter.reserve(&pacing).expect("first slot");
+        let middle = limiter.reserve(&pacing).expect("middle slot");
+        let last = limiter.reserve(&pacing).expect("last slot");
+        drop(middle);
+
+        first.wait().await;
+        last.wait().await;
+        assert_dispatches(&[started_at.elapsed().as_secs_f64()], &[20.0]);
+        // The live 20 s slot still spaces the next request after it.
+        let next = sequential_dispatches(&limiter, &pacing, 1, started_at).await;
+        assert_dispatches(&next, &[30.0]);
     }
 
     fn interactive_budgeted_pacing(domain_key: &str, per_minute: u32) -> IndexerPacing {
