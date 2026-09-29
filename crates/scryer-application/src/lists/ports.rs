@@ -43,6 +43,11 @@ impl ListSubscriptionQuery {
 
 #[async_trait]
 pub trait ListSubscriptionRepository: Send + Sync {
+    /// Stores a new subscription. A public subscription whose source
+    /// (provider, source type and params) another public subscription already
+    /// follows is refused with a validation error; the check and the insert
+    /// are one atomic step, so concurrent follows of one source cannot both
+    /// succeed.
     async fn create(&self, subscription: ListSubscription) -> AppResult<ListSubscription>;
 
     /// Rewrites the subscription's settings and routes. The sync bookkeeping

@@ -84,7 +84,9 @@ fn subscription(id: &str, scope: ListScope, owner: &str) -> ListSubscription {
         source: ListSource {
             provider: "fixture-provider".into(),
             source_type: "user_list".into(),
-            params: BTreeMap::from([("list_id".to_string(), "fixture-list-1".to_string())]),
+            // Each subscription follows its own list: two public follows of
+            // one source cannot coexist.
+            params: BTreeMap::from([("list_id".to_string(), format!("fixture-list-{id}"))]),
             origin: ListSourceOrigin::ProviderFetch,
         },
         name: "Fixture List".into(),
@@ -657,6 +659,48 @@ async fn exclusions_match_by_id_kind_and_scope() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn a_source_can_be_followed_publicly_only_once() {
+    let store = test_store(None).await;
+    ListSubscriptionRepository::create(&store, subscription("sub-1", ListScope::Public, OWNER))
+        .await
+        .expect("first public follow");
+
+    let mut same_source = subscription("sub-2", ListScope::Public, OWNER);
+    same_source.source = subscription("sub-1", ListScope::Public, OWNER).source;
+    let refused = ListSubscriptionRepository::create(&store, same_source.clone())
+        .await
+        .expect_err("a second public follow of the same source is refused");
+    assert!(matches!(
+        refused,
+        scryer_application::AppError::Validation(_)
+    ));
+    assert!(
+        ListSubscriptionRepository::get_by_id(&store, "sub-2")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // A member's personal copy of the same source is not a public follow.
+    let mut personal = same_source;
+    personal.id = "sub-3".into();
+    personal.scope = ListScope::Personal;
+    ListSubscriptionRepository::create(&store, personal)
+        .await
+        .expect("personal follow of a publicly followed source");
+
+    // Once the public follow is gone the source can be followed again.
+    ListSubscriptionRepository::delete(&store, "sub-1")
+        .await
+        .expect("unfollow");
+    let mut again = subscription("sub-4", ListScope::Public, OWNER);
+    again.source = subscription("sub-1", ListScope::Public, OWNER).source;
+    ListSubscriptionRepository::create(&store, again)
+        .await
+        .expect("follow again after unfollowing");
 }
 
 #[tokio::test]

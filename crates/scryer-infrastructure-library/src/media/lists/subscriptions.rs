@@ -36,11 +36,25 @@ impl ListSubscriptionRepository for ListStore {
     async fn create(&self, subscription: ListSubscription) -> AppResult<ListSubscription> {
         let insert_args = subscription_insert_args(&subscription)?;
         let route_rows = route_rows(&subscription)?;
+        let public_source = match subscription.scope {
+            ListScope::Public => Some(vec![
+                SqlArg::Text(subscription.source.provider.clone()),
+                SqlArg::Text(subscription.source.source_type.clone()),
+                json_arg(&subscription.source.params)?,
+            ]),
+            ListScope::Personal => None,
+        };
         SqlRuntime::run_in_transaction(&self.datastore, "create_list_subscription", move |tx| {
             let insert_args = insert_args.clone();
             let route_rows = route_rows.clone();
             let subscription = subscription.clone();
+            let public_source = public_source.clone();
             Box::pin(async move {
+                if let Some(source) = public_source
+                    && public_source_followed_tx(tx, &source).await?
+                {
+                    return Err(AppError::Validation("this list is already followed".into()));
+                }
                 SqlRuntime::execute(
                     SqlExec::Tx(tx),
                     &format!(
@@ -340,6 +354,36 @@ fn count_arg(value: u64) -> SqlArg {
 
 fn count_from(row: &SqlRow, column: &str) -> AppResult<u64> {
     Ok(row.i64(column)?.max(0) as u64)
+}
+
+/// Arbitrary key of the transaction-scoped Postgres lock that serializes
+/// new public follows, so two concurrent follows of one source cannot both
+/// pass the check below.
+const PUBLIC_FOLLOW_LOCK_KEY: i64 = 0x6c69_7374_666f_6c6c;
+
+/// Whether a public subscription already follows the source `(provider,
+/// source_type, params_json)`. On SQLite the writer gate already serializes
+/// this transaction with every other write; on Postgres a transaction-scoped
+/// advisory lock does, held until the insert that follows commits.
+async fn public_source_followed_tx(tx: &mut SqlTx<'_>, source: &[SqlArg]) -> AppResult<bool> {
+    if let SqlTx::Postgres(_) = tx {
+        SqlRuntime::execute(
+            SqlExec::Tx(tx),
+            "SELECT pg_advisory_xact_lock({})",
+            &[SqlArg::I64(PUBLIC_FOLLOW_LOCK_KEY)],
+        )
+        .await?;
+    }
+    let row = SqlRuntime::fetch_optional(
+        SqlExec::Tx(tx),
+        "SELECT id FROM list_subscriptions
+          WHERE scope = 'public' AND provider = {} AND source_type = {}
+            AND source_params_json = {}
+          LIMIT 1",
+        source,
+    )
+    .await?;
+    Ok(row.is_some())
 }
 
 fn subscription_insert_args(subscription: &ListSubscription) -> AppResult<Vec<SqlArg>> {
