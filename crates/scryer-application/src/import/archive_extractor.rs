@@ -32,6 +32,24 @@ const MAX_PLUGIN_OUTPUT_ENTRIES: usize = MAX_PLUGIN_OUTPUT_FILES + MAX_PLUGIN_OU
 const MAX_PLUGIN_OUTPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_DISCOVERY_DEPTH: usize = 3;
 const MAX_ARCHIVE_DISCOVERY_DIRECTORIES: usize = 256;
+/// Archive sets one download may hold. More than this is refused rather than
+/// extracted in part.
+const MAX_ARCHIVE_SETS: usize = 256;
+/// Levels of archives inside extracted archives that are extracted in turn.
+const MAX_NESTED_ARCHIVE_DEPTH: usize = 2;
+/// Archives found inside extracted output, across every level.
+const MAX_NESTED_ARCHIVES: usize = 16;
+const NESTED_OUTPUT_DIR_PREFIX: &str = "nested-";
+
+/// Output counted across every archive set and nested level of one workspace,
+/// so the output caps bound the whole extraction rather than each set.
+#[derive(Debug, Clone, Copy, Default)]
+struct PluginOutputTotals {
+    entries: usize,
+    directories: usize,
+    files: usize,
+    bytes: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct ArchiveExtractionDestination {
@@ -96,15 +114,21 @@ impl ArchiveType {
 /// If the download directory contains no importable video files but has
 /// archive files, extract them to a hidden destination-side staging directory
 /// and return the path. Returns `None` if no extraction was needed (importable
-/// video files exist directly).
+/// video files exist directly) or the archives held no video.
 ///
 /// `is_sample` is the sample rule the import scan will apply afterwards: a
 /// video it would discard does not make the download's archives redundant.
 ///
-/// The first attempt never carries a password. Only when the plugin answers
-/// that the archive needs one (or that the one given is wrong) are the
-/// `passwords` candidates tried, in order, each in a fresh workspace; any other
-/// failure ends the attempts and is returned as it is.
+/// Every archive set the download holds is extracted into its own output
+/// directory of one workspace, and an output that holds no importable video
+/// but does hold archives has those extracted too, a bounded number of levels
+/// deep. Any set that fails fails the whole extraction and the workspace is
+/// removed: the import never proceeds on part of a download.
+///
+/// Each set is first attempted without a password. Only when the plugin
+/// answers that it needs one (or that the one given is wrong) are the
+/// `passwords` candidates tried, in order; any other failure ends the attempts
+/// and is returned as it is.
 pub async fn extract_archives_if_needed(
     dir: &Path,
     is_sample: fn(&Path) -> bool,
@@ -113,87 +137,28 @@ pub async fn extract_archives_if_needed(
     archive_provider: Option<Arc<dyn ArchiveExtractorPluginProvider>>,
 ) -> AppResult<Option<PathBuf>> {
     let dir = dir.to_path_buf();
-    let archive = {
+    let sets = {
         let dir = dir.clone();
         tokio::task::spawn_blocking(move || plan_archive_extraction(&dir, is_sample))
             .await
             .map_err(|e| AppError::Repository(format!("archive detection task failed: {e}")))??
     };
 
-    let Some((archive_path, archive_type)) = archive else {
+    if sets.is_empty() {
         return Ok(None);
-    };
+    }
     let Some(destination) = destination else {
         return Err(AppError::Validation(format!(
             "archive extraction requires a resolved import destination before staging output for {}",
             dir.display()
         )));
     };
-
-    let attempt = |password: Option<&str>| {
-        extract_archive_attempt(
-            &dir,
-            &archive_path,
-            archive_type,
-            &destination,
-            password.map(str::to_string),
-            archive_provider.clone(),
-        )
-    };
-    let mut rejection = match attempt(None).await {
-        ArchiveAttempt::Finished(result) => return result,
-        ArchiveAttempt::PasswordRejected(error) => error,
-    };
-    for (index, candidate) in passwords.iter().enumerate() {
-        match attempt(Some(candidate.value())).await {
-            ArchiveAttempt::Finished(result) => {
-                if result.is_ok() {
-                    info!(
-                        password_source = candidate.source().as_str(),
-                        candidate = index + 1,
-                        candidates = passwords.len(),
-                        "archive password candidate accepted"
-                    );
-                }
-                return result;
-            }
-            ArchiveAttempt::PasswordRejected(error) => rejection = error,
-        }
-    }
-    if !passwords.is_empty() {
-        info!(
-            candidates = passwords.len(),
-            "no archive password candidate was accepted"
-        );
-    }
-    Err(rejection)
-}
-
-/// The outcome of one extraction attempt. A password rejection is the only
-/// outcome that lets the next password candidate be tried.
-enum ArchiveAttempt {
-    Finished(AppResult<Option<PathBuf>>),
-    PasswordRejected(AppError),
-}
-
-/// One extraction attempt in a workspace of its own. Whatever it does not
-/// hand back as the extraction result is cleaned up before it returns.
-async fn extract_archive_attempt(
-    dir: &Path,
-    archive_path: &Path,
-    archive_type: ArchiveType,
-    destination: &ArchiveExtractionDestination,
-    password: Option<String>,
-    archive_provider: Option<Arc<dyn ArchiveExtractorPluginProvider>>,
-) -> ArchiveAttempt {
-    let workspace = match ArchiveExtractionWorkspace::create(destination).await {
-        Ok(workspace) => workspace,
-        Err(error) => return ArchiveAttempt::Finished(Err(error)),
-    };
+    let workspace = ArchiveExtractionWorkspace::create(&destination).await?;
 
     info!(
-        archive = %archive_path.display(),
-        archive_type = archive_type.as_str(),
+        archive = %sets[0].0.display(),
+        archive_type = sets[0].1.as_str(),
+        archive_sets = sets.len(),
         workspace = %workspace.root.display(),
         "extracting archive before import"
     );
@@ -201,52 +166,302 @@ async fn extract_archive_attempt(
     let workspace_root = workspace.root.clone();
     let Some(provider) = archive_provider else {
         cleanup_extracted_dir(&workspace_root).await;
-        return ArchiveAttempt::Finished(Err(AppError::archive_extraction_plugin_required(Some(
+        return Err(AppError::archive_extraction_plugin_required(Some(
             dir.to_string_lossy().into_owned(),
-        ))));
+        )));
     };
 
-    // The plugin owns PAR2: it is handed the archive's own directory as a
-    // read-only source preopen, finds any `.par2` set there itself, and repairs
-    // into its writable output directory before (or instead of) extracting.
-    let source_dir = archive_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
-    let extraction = extract_with_archive_plugin(ArchivePluginExtraction {
-        source_dir,
-        archive_path: archive_path.to_path_buf(),
-        archive_type,
-        format: archive_plugin_format_for_type(archive_type),
-        password,
-        provider,
-        output_dir: workspace.output_dir.clone(),
-    })
-    .await;
+    let extraction =
+        extract_into_workspace(&workspace, sets, is_sample, passwords, &provider).await;
 
     match extraction {
-        ArchiveAttempt::Finished(Ok(Some(_))) => ArchiveAttempt::Finished(Ok(Some(workspace_root))),
-        ArchiveAttempt::Finished(Ok(None)) => {
+        Ok(true) => Ok(Some(workspace_root)),
+        Ok(false) => {
+            info!("archive extracted but no video files found in output");
             cleanup_extracted_dir(&workspace_root).await;
-            ArchiveAttempt::Finished(Ok(None))
+            Ok(None)
         }
-        ArchiveAttempt::Finished(Err(error)) => {
+        Err(error) => {
             cleanup_extracted_dir(&workspace_root).await;
-            ArchiveAttempt::Finished(Err(error))
-        }
-        ArchiveAttempt::PasswordRejected(error) => {
-            cleanup_extracted_dir(&workspace_root).await;
-            ArchiveAttempt::PasswordRejected(error)
+            Err(error)
         }
     }
+}
+
+/// Extracts every set, then any archives found in outputs that hold no
+/// importable video. Returns whether the workspace ended up holding video.
+async fn extract_into_workspace(
+    workspace: &ArchiveExtractionWorkspace,
+    sets: Vec<(PathBuf, ArchiveType)>,
+    is_sample: fn(&Path) -> bool,
+    passwords: &ArchivePasswordCandidates,
+    provider: &Arc<dyn ArchiveExtractorPluginProvider>,
+) -> AppResult<bool> {
+    let mut totals = PluginOutputTotals::default();
+    let mut pass_outputs = Vec::with_capacity(sets.len());
+    for (index, (archive_path, archive_type)) in sets.into_iter().enumerate() {
+        let output_dir = if index == 0 {
+            workspace.output_dir.clone()
+        } else {
+            workspace
+                .root
+                .join(format!("{ARCHIVE_STAGING_OUTPUT_DIR}-{}", index + 1))
+        };
+        let set = ArchiveSetExtraction {
+            workspace,
+            archive_path: &archive_path,
+            archive_type,
+            output_dir: &output_dir,
+            passwords,
+            provider,
+        };
+        set.extract(&mut totals).await?;
+        pass_outputs.push(output_dir);
+    }
+
+    let mut nested_archives = 0usize;
+    for depth in 1..=MAX_NESTED_ARCHIVE_DEPTH + 1 {
+        let inner_sets = {
+            let outputs = pass_outputs.clone();
+            tokio::task::spawn_blocking(move || nested_archive_sets(&outputs, is_sample))
+                .await
+                .map_err(|e| AppError::Repository(format!("archive detection task failed: {e}")))?
+        };
+        if inner_sets.is_empty() {
+            break;
+        }
+        if depth > MAX_NESTED_ARCHIVE_DEPTH {
+            if has_importable_video_files(&workspace.root, is_sample) {
+                info!(
+                    depth = MAX_NESTED_ARCHIVE_DEPTH,
+                    "leaving archives nested deeper than the extraction limit"
+                );
+                break;
+            }
+            return Err(AppError::Validation(format!(
+                "archive holds archives nested more than {MAX_NESTED_ARCHIVE_DEPTH} levels deep"
+            )));
+        }
+        nested_archives += inner_sets.len();
+        if nested_archives > MAX_NESTED_ARCHIVES {
+            return Err(AppError::Validation(format!(
+                "archive holds more than {MAX_NESTED_ARCHIVES} nested archives"
+            )));
+        }
+        info!(
+            depth,
+            archive_sets = inner_sets.len(),
+            "extracting archives found inside extracted output"
+        );
+        let mut next_outputs = Vec::with_capacity(inner_sets.len());
+        for (index, (archive_path, archive_type)) in inner_sets.into_iter().enumerate() {
+            let output_dir = workspace
+                .root
+                .join(format!("{NESTED_OUTPUT_DIR_PREFIX}{depth}-{}", index + 1));
+            let set = ArchiveSetExtraction {
+                workspace,
+                archive_path: &archive_path,
+                archive_type,
+                output_dir: &output_dir,
+                passwords,
+                provider,
+            };
+            set.extract(&mut totals).await?;
+            next_outputs.push(output_dir);
+        }
+        pass_outputs = next_outputs;
+    }
+
+    Ok(has_video_files(&workspace.root))
+}
+
+/// The archive sets inside the given extraction outputs whose own output holds
+/// no importable video.
+fn nested_archive_sets(
+    outputs: &[PathBuf],
+    is_sample: fn(&Path) -> bool,
+) -> Vec<(PathBuf, ArchiveType)> {
+    outputs
+        .iter()
+        .filter(|output| !has_importable_video_files(output, is_sample))
+        .flat_map(|output| find_archive_sets(output))
+        .collect()
+}
+
+/// One archive set extracted into its own output directory of the workspace.
+struct ArchiveSetExtraction<'a> {
+    workspace: &'a ArchiveExtractionWorkspace,
+    archive_path: &'a Path,
+    archive_type: ArchiveType,
+    output_dir: &'a Path,
+    passwords: &'a ArchivePasswordCandidates,
+    provider: &'a Arc<dyn ArchiveExtractorPluginProvider>,
+}
+
+impl ArchiveSetExtraction<'_> {
+    async fn extract(&self, totals: &mut PluginOutputTotals) -> AppResult<()> {
+        let mut rejection = match self.attempt(None, totals).await? {
+            ArchiveAttempt::Extracted => return Ok(()),
+            ArchiveAttempt::PasswordRejected(error) => error,
+        };
+        for (index, candidate) in self.passwords.iter().enumerate() {
+            match self.attempt(Some(candidate.value()), totals).await? {
+                ArchiveAttempt::Extracted => {
+                    info!(
+                        password_source = candidate.source().as_str(),
+                        candidate = index + 1,
+                        candidates = self.passwords.len(),
+                        "archive password candidate accepted"
+                    );
+                    return Ok(());
+                }
+                ArchiveAttempt::PasswordRejected(error) => rejection = error,
+            }
+        }
+        if !self.passwords.is_empty() {
+            info!(
+                candidates = self.passwords.len(),
+                "no archive password candidate was accepted"
+            );
+        }
+        Err(rejection)
+    }
+
+    /// One plugin call into a fresh output directory. Output left by an
+    /// attempt the plugin refused for its password is discarded, so a later
+    /// attempt starts empty and never counts against the output caps.
+    async fn attempt(
+        &self,
+        password: Option<&str>,
+        totals: &mut PluginOutputTotals,
+    ) -> AppResult<ArchiveAttempt> {
+        prepare_workspace_output_dir(&self.workspace.root, self.output_dir).await?;
+
+        // The plugin owns PAR2: it is handed the archive's own directory as a
+        // read-only source preopen, finds any `.par2` set there itself, and
+        // repairs into its writable output directory before (or instead of)
+        // extracting.
+        let source_dir = self
+            .archive_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        ensure_source_outside_output(&source_dir, self.output_dir)?;
+        let attempt = extract_with_archive_plugin(
+            ArchivePluginExtraction {
+                source_dir,
+                archive_path: self.archive_path.to_path_buf(),
+                archive_type: self.archive_type,
+                format: archive_plugin_format_for_type(self.archive_type),
+                password: password.map(str::to_string),
+                provider: Arc::clone(self.provider),
+                output_dir: self.output_dir.to_path_buf(),
+            },
+            totals,
+        )
+        .await?;
+        if matches!(attempt, ArchiveAttempt::PasswordRejected(_)) {
+            discard_workspace_output_dir(&self.workspace.root, self.output_dir).await;
+        }
+        Ok(attempt)
+    }
+}
+
+/// The outcome of one extraction attempt that did not fail outright. A
+/// password rejection is the only outcome that lets the next password
+/// candidate be tried.
+enum ArchiveAttempt {
+    Extracted,
+    PasswordRejected(AppError),
+}
+
+/// Creates an output directory directly inside a staging workspace, unless it
+/// already exists and is empty.
+async fn prepare_workspace_output_dir(workspace_root: &Path, output_dir: &Path) -> AppResult<()> {
+    if output_dir.parent() != Some(workspace_root) {
+        return Err(AppError::Validation(format!(
+            "archive output directory {} is not inside the staging workspace",
+            output_dir.display()
+        )));
+    }
+    match tokio::fs::create_dir(output_dir).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut entries = tokio::fs::read_dir(output_dir).await.map_err(|error| {
+                AppError::Repository(format!(
+                    "failed to read archive staging output directory {}: {error}",
+                    output_dir.display()
+                ))
+            })?;
+            match entries.next_entry().await {
+                Ok(None) => Ok(()),
+                _ => Err(AppError::Validation(format!(
+                    "archive staging output directory {} is not empty",
+                    output_dir.display()
+                ))),
+            }
+        }
+        Err(error) => Err(AppError::Repository(format!(
+            "failed to create archive staging output directory {}: {error}",
+            output_dir.display()
+        ))),
+    }
+}
+
+/// Removes an output directory Scryer created directly inside one of its own
+/// staging workspaces, and nothing else.
+async fn discard_workspace_output_dir(workspace_root: &Path, output_dir: &Path) {
+    if is_archive_staging_dir(workspace_root)
+        && output_dir.parent() == Some(workspace_root)
+        && output_dir.file_name().is_some_and(|name| {
+            name.to_str()
+                .is_some_and(|name| is_workspace_output_dir_name(name))
+        })
+    {
+        let _ = tokio::fs::remove_dir_all(output_dir).await;
+    }
+}
+
+fn is_workspace_output_dir_name(name: &str) -> bool {
+    name == ARCHIVE_STAGING_OUTPUT_DIR
+        || name
+            .strip_prefix(ARCHIVE_STAGING_OUTPUT_DIR)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
+        || name
+            .strip_prefix(NESTED_OUTPUT_DIR_PREFIX)
+            .is_some_and(|rest| {
+                !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+            })
+}
+
+/// The plugin's source preopen is read-only and its output preopen writable.
+/// A source inside (or equal to) the output would let the guest rewrite the
+/// archive it is reading.
+fn ensure_source_outside_output(source_dir: &Path, output_dir: &Path) -> AppResult<()> {
+    let canonical = |path: &Path| {
+        path.canonicalize().map_err(|error| {
+            AppError::Repository(format!(
+                "failed to canonicalize archive path {}: {error}",
+                path.display()
+            ))
+        })
+    };
+    if canonical(source_dir)?.starts_with(canonical(output_dir)?) {
+        return Err(AppError::Validation(format!(
+            "archive source {} lies inside its own extraction output",
+            source_dir.display()
+        )));
+    }
+    Ok(())
 }
 
 pub fn archive_extraction_would_be_needed(
     dir: &Path,
     is_sample: fn(&Path) -> bool,
 ) -> AppResult<bool> {
-    Ok(plan_archive_extraction(dir, is_sample)?.is_some())
+    Ok(!plan_archive_extraction(dir, is_sample)?.is_empty())
 }
 
 /// Check if an extraction error indicates a password-protected archive.
@@ -259,27 +474,33 @@ pub fn is_timeout_error(error: &AppError) -> bool {
     matches!(error, AppError::ArchiveExtractionTimedOut { .. })
 }
 
+/// The archive sets to extract, each named by its first volume: the download
+/// itself when it is an archive file, otherwise every set `find_archive_sets`
+/// discovers, unless the download already holds importable video.
 fn plan_archive_extraction(
     dir: &Path,
     is_sample: fn(&Path) -> bool,
-) -> AppResult<Option<(PathBuf, ArchiveType)>> {
+) -> AppResult<Vec<(PathBuf, ArchiveType)>> {
     if dir.is_file() {
-        return Ok(archive_type_for_path(dir).map(|archive_type| (dir.to_path_buf(), archive_type)));
+        return Ok(archive_type_for_path(dir)
+            .map(|archive_type| (dir.to_path_buf(), archive_type))
+            .into_iter()
+            .collect());
     }
 
     // If importable video files already exist, no extraction needed. A release
     // whose only loose video is its sample still needs its archives.
     if has_importable_video_files(dir, is_sample) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
-    // Look for archives to extract.
-    let archive = find_primary_archive(dir);
-    let Some((archive_path, archive_type)) = archive else {
-        return Ok(None);
-    };
-
-    Ok(Some((archive_path, archive_type)))
+    let sets = find_archive_sets(dir);
+    if sets.len() > MAX_ARCHIVE_SETS {
+        return Err(AppError::Validation(format!(
+            "download holds more than {MAX_ARCHIVE_SETS} archive sets"
+        )));
+    }
+    Ok(sets)
 }
 
 fn archive_plugin_format_for_type(archive_type: ArchiveType) -> ArchivePluginFormat {
@@ -290,7 +511,10 @@ fn archive_plugin_format_for_type(archive_type: ArchiveType) -> ArchivePluginFor
     }
 }
 
-async fn extract_with_archive_plugin(request: ArchivePluginExtraction) -> ArchiveAttempt {
+async fn extract_with_archive_plugin(
+    request: ArchivePluginExtraction,
+    totals: &mut PluginOutputTotals,
+) -> AppResult<ArchiveAttempt> {
     let ArchivePluginExtraction {
         source_dir,
         archive_path,
@@ -303,8 +527,8 @@ async fn extract_with_archive_plugin(request: ArchivePluginExtraction) -> Archiv
 
     let (client, operation) = {
         let Some(client) = provider.client_for_format(format) else {
-            return ArchiveAttempt::Finished(Err(AppError::archive_extraction_plugin_required(
-                Some(source_dir.to_string_lossy().into_owned()),
+            return Err(AppError::archive_extraction_plugin_required(Some(
+                source_dir.to_string_lossy().into_owned(),
             )));
         };
         let operation = ArchivePluginOperation::ExtractArchive {
@@ -316,17 +540,15 @@ async fn extract_with_archive_plugin(request: ArchivePluginExtraction) -> Archiv
         (client, operation)
     };
     let request = ArchivePluginProcessRequest { operation };
-    let response = match client.process(request).await {
-        Ok(response) => response,
-        Err(error) => return ArchiveAttempt::Finished(Err(error)),
-    };
+    let response = client.process(request).await?;
     let password_rejected = matches!(
         response.status,
         ArchivePluginStatus::PasswordRequired | ArchivePluginStatus::PasswordInvalid
     );
-    match handle_archive_plugin_response(archive_type, output_dir, response) {
-        Err(error) if password_rejected => ArchiveAttempt::PasswordRejected(error),
-        result => ArchiveAttempt::Finished(result),
+    match handle_archive_plugin_response(archive_type, output_dir, response, totals) {
+        Ok(()) => Ok(ArchiveAttempt::Extracted),
+        Err(error) if password_rejected => Ok(ArchiveAttempt::PasswordRejected(error)),
+        Err(error) => Err(error),
     }
 }
 
@@ -426,18 +648,32 @@ fn is_old_rar_volume_extension(ext: &str) -> bool {
     matches!(chars.next(), Some('r'..='z')) && ext.len() >= 3 && chars.all(|ch| ch.is_ascii_digit())
 }
 
+/// Checks one plugin answer. Output left by a successful call that fails
+/// validation, or by a failed call, is removed from this set's own output
+/// directory; the caller removes the whole workspace on any error.
 fn handle_archive_plugin_response(
     archive_type: ArchiveType,
     output_dir: PathBuf,
     response: ArchivePluginProcessResponse,
-) -> AppResult<Option<PathBuf>> {
+    totals: &mut PluginOutputTotals,
+) -> AppResult<()> {
     match response.status {
         ArchivePluginStatus::Ok => {
-            if let Err(error) = validate_archive_plugin_output(&output_dir, &response) {
-                let _ = std::fs::remove_dir_all(&output_dir);
-                return Err(error);
+            match validate_archive_plugin_output(&output_dir, &response, *totals) {
+                Ok(updated) => {
+                    *totals = updated;
+                    info!(
+                        archive_type = archive_type.as_str(),
+                        output = %output_dir.display(),
+                        "archive set extracted"
+                    );
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_dir_all(&output_dir);
+                    Err(error)
+                }
             }
-            verify_extracted_video(archive_type, output_dir)
         }
         ArchivePluginStatus::UnsupportedFormat => Err(AppError::Validation(format!(
             "archive plugin does not support {} extraction",
@@ -487,10 +723,13 @@ fn archive_plugin_failure_error(error_code: Option<&str>, message: Option<&str>)
     }
 }
 
+/// Validates one output directory and returns `totals` with its contents added.
+/// The caps apply to the running totals, so they bound the whole workspace.
 fn validate_archive_plugin_output(
     output_dir: &Path,
     response: &ArchivePluginProcessResponse,
-) -> AppResult<()> {
+    totals: PluginOutputTotals,
+) -> AppResult<PluginOutputTotals> {
     let output_root = output_dir.canonicalize().map_err(|error| {
         AppError::Repository(format!(
             "failed to canonicalize archive plugin output directory {}: {error}",
@@ -523,10 +762,12 @@ fn validate_archive_plugin_output(
         }
     }
 
-    let mut entry_count = 0usize;
-    let mut directory_count = 0usize;
-    let mut file_count = 0usize;
-    let mut expanded_bytes = 0u64;
+    let PluginOutputTotals {
+        entries: mut entry_count,
+        directories: mut directory_count,
+        files: mut file_count,
+        bytes: mut expanded_bytes,
+    } = totals;
     let mut stack = vec![output_dir.to_path_buf()];
     while let Some(path) = stack.pop() {
         entry_count += 1;
@@ -599,7 +840,12 @@ fn validate_archive_plugin_output(
         }
     }
 
-    Ok(())
+    Ok(PluginOutputTotals {
+        entries: entry_count,
+        directories: directory_count,
+        files: file_count,
+        bytes: expanded_bytes,
+    })
 }
 
 fn safe_archive_output_path(output_dir: &Path, entry_name: &str) -> AppResult<PathBuf> {
@@ -647,29 +893,6 @@ fn ensure_path_under_output_with_root(path: &Path, output_root: &Path) -> AppRes
     Ok(())
 }
 
-fn verify_extracted_video(
-    archive_type: ArchiveType,
-    output_dir: PathBuf,
-) -> AppResult<Option<PathBuf>> {
-    // Verify we got something useful out.
-    if has_video_files(&output_dir) {
-        info!(
-            archive_type = archive_type.as_str(),
-            output = %output_dir.display(),
-            "archive extraction complete, video files found"
-        );
-        Ok(Some(output_dir))
-    } else {
-        info!(
-            archive_type = archive_type.as_str(),
-            "archive extracted but no video files found in output"
-        );
-        // Clean up the empty extraction.
-        let _ = std::fs::remove_dir_all(&output_dir);
-        Ok(None)
-    }
-}
-
 fn has_video_files(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
@@ -704,13 +927,13 @@ fn has_importable_video_files(dir: &Path, is_sample: fn(&Path) -> bool) -> bool 
     false
 }
 
-/// Find the primary archive file of a download: the first directory holding an
-/// archive, searched top level first and then subdirectories breadth-first in
-/// name order, and within it the first set of the preferred type.
-fn find_primary_archive(dir: &Path) -> Option<(PathBuf, ArchiveType)> {
+/// Every archive set of a download, each named by its first volume: the top
+/// level first, then subdirectories breadth-first in name order.
+fn find_archive_sets(dir: &Path) -> Vec<(PathBuf, ArchiveType)> {
     archive_discovery_dirs(dir)
         .iter()
-        .find_map(|dir| archive_sets_in_dir(dir).into_iter().next())
+        .flat_map(|dir| archive_sets_in_dir(dir))
+        .collect()
 }
 
 /// The download root followed by its subdirectories, breadth-first in name
@@ -1020,6 +1243,10 @@ mod tests {
         })
     }
 
+    fn first_archive_set(dir: &Path) -> Option<(PathBuf, ArchiveType)> {
+        find_archive_sets(dir).into_iter().next()
+    }
+
     fn operator_password(value: &str) -> ArchivePasswordCandidates {
         let mut candidates = ArchivePasswordCandidates::default();
         candidates.push_operator(Some(value));
@@ -1324,20 +1551,20 @@ mod tests {
     }
 
     #[test]
-    fn find_primary_archive_prefers_rar() {
+    fn first_archive_set_prefers_rar() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("release.rar"), b"rar").unwrap();
         fs::write(dir.path().join("release.7z"), b"7z").unwrap();
-        let (path, kind) = find_primary_archive(dir.path()).unwrap();
+        let (path, kind) = first_archive_set(dir.path()).unwrap();
         assert!(path.extension().unwrap() == "rar");
         assert!(matches!(kind, ArchiveType::Rar));
     }
 
     #[test]
-    fn find_primary_archive_finds_7z() {
+    fn first_archive_set_finds_7z() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("release.7z"), b"7z").unwrap();
-        let (_, kind) = find_primary_archive(dir.path()).unwrap();
+        let (_, kind) = first_archive_set(dir.path()).unwrap();
         assert!(matches!(kind, ArchiveType::SevenZip));
     }
 
@@ -1355,6 +1582,7 @@ mod tests {
             let (planned_path, archive_type) =
                 plan_archive_extraction(&archive_path, is_sample_named_file)
                     .unwrap()
+                    .pop()
                     .expect("direct archive file should require extraction");
 
             assert_eq!(planned_path, archive_path);
@@ -1363,22 +1591,22 @@ mod tests {
     }
 
     #[test]
-    fn find_primary_archive_finds_zip() {
+    fn first_archive_set_finds_zip() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("release.zip"), b"zip").unwrap();
-        let (_, kind) = find_primary_archive(dir.path()).unwrap();
+        let (_, kind) = first_archive_set(dir.path()).unwrap();
         assert!(matches!(kind, ArchiveType::Zip));
     }
 
     #[test]
-    fn find_primary_archive_none_for_video_only() {
+    fn first_archive_set_none_for_video_only() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("movie.mkv"), b"video").unwrap();
-        assert!(find_primary_archive(dir.path()).is_none());
+        assert!(first_archive_set(dir.path()).is_none());
     }
 
     #[test]
-    fn find_primary_archive_finds_a_set_in_a_subdirectory() {
+    fn first_archive_set_finds_a_set_in_a_subdirectory() {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("Lantern.Vale.2019.1080p.BluRay-NOGRP");
         fs::create_dir(&nested).unwrap();
@@ -1386,28 +1614,28 @@ mod tests {
         fs::write(nested.join("lantern.vale.part01.rar"), b"rar").unwrap();
         fs::write(dir.path().join("lantern.vale.nfo"), b"nfo").unwrap();
 
-        let (path, kind) = find_primary_archive(dir.path()).unwrap();
+        let (path, kind) = first_archive_set(dir.path()).unwrap();
 
         assert!(matches!(kind, ArchiveType::Rar));
         assert_eq!(path, nested.join("lantern.vale.part01.rar"));
     }
 
     #[test]
-    fn find_primary_archive_prefers_the_top_level_over_subdirectories() {
+    fn first_archive_set_prefers_the_top_level_over_subdirectories() {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("Extras");
         fs::create_dir(&nested).unwrap();
         fs::write(nested.join("extras.rar"), b"rar").unwrap();
         fs::write(dir.path().join("lantern.vale.zip"), b"zip").unwrap();
 
-        let (path, kind) = find_primary_archive(dir.path()).unwrap();
+        let (path, kind) = first_archive_set(dir.path()).unwrap();
 
         assert!(matches!(kind, ArchiveType::Zip));
         assert_eq!(path, dir.path().join("lantern.vale.zip"));
     }
 
     #[test]
-    fn find_primary_archive_searches_subdirectories_in_name_order() {
+    fn first_archive_set_searches_subdirectories_in_name_order() {
         let dir = tempfile::tempdir().unwrap();
         for (folder, archive) in [("CD2", "vale.cd2.rar"), ("CD1", "vale.cd1.rar")] {
             let nested = dir.path().join(folder);
@@ -1415,13 +1643,13 @@ mod tests {
             fs::write(nested.join(archive), b"rar").unwrap();
         }
 
-        let (path, _) = find_primary_archive(dir.path()).unwrap();
+        let (path, _) = first_archive_set(dir.path()).unwrap();
 
         assert_eq!(path, dir.path().join("CD1").join("vale.cd1.rar"));
     }
 
     #[test]
-    fn find_primary_archive_skips_sample_hidden_and_staging_directories() {
+    fn first_archive_set_skips_sample_hidden_and_staging_directories() {
         let dir = tempfile::tempdir().unwrap();
         for folder in [
             "Sample",
@@ -1435,11 +1663,11 @@ mod tests {
             fs::write(nested.join("vale.rar"), b"rar").unwrap();
         }
 
-        assert!(find_primary_archive(dir.path()).is_none());
+        assert!(first_archive_set(dir.path()).is_none());
     }
 
     #[test]
-    fn find_primary_archive_stops_at_the_depth_bound() {
+    fn first_archive_set_stops_at_the_depth_bound() {
         let dir = tempfile::tempdir().unwrap();
         let mut within = dir.path().to_path_buf();
         for level in 0..MAX_ARCHIVE_DISCOVERY_DEPTH {
@@ -1449,10 +1677,10 @@ mod tests {
         fs::create_dir_all(&beyond).unwrap();
         fs::write(beyond.join("vale.rar"), b"rar").unwrap();
 
-        assert!(find_primary_archive(dir.path()).is_none());
+        assert!(first_archive_set(dir.path()).is_none());
 
         fs::write(within.join("vale.7z"), b"7z").unwrap();
-        let (path, kind) = find_primary_archive(dir.path()).unwrap();
+        let (path, kind) = first_archive_set(dir.path()).unwrap();
         assert!(matches!(kind, ArchiveType::SevenZip));
         assert_eq!(path, within.join("vale.7z"));
     }
@@ -1516,6 +1744,7 @@ mod tests {
 
         let (archive, kind) = plan_archive_extraction(&release, is_sample_file)
             .unwrap()
+            .pop()
             .expect("a series release whose only video is its sample needs its archives");
 
         assert!(matches!(kind, ArchiveType::Rar));
@@ -1566,12 +1795,12 @@ mod tests {
         assert!(
             plan_archive_extraction(&release, is_sample_file)
                 .unwrap()
-                .is_none()
+                .is_empty()
         );
         assert!(
             plan_archive_extraction(&release, is_sample_named_file)
                 .unwrap()
-                .is_none()
+                .is_empty()
         );
     }
 
@@ -2111,5 +2340,631 @@ mod tests {
                 .to_string()
                 .contains("only_code")
         );
+    }
+    /// How the scripted plugin treats one archive, keyed by file name.
+    enum TreeStep {
+        /// Extracts the given members.
+        Emits(Vec<(&'static str, &'static [u8])>),
+        /// Fails without a password prompt.
+        Fails,
+        /// Refuses every password but this one, then extracts a video.
+        Locked(&'static str),
+    }
+
+    /// Answers extraction calls per archive name, like a torrent holding
+    /// several archive sets and archives packed inside archives. Every call
+    /// first writes a partial member, so leftovers of refused attempts show.
+    struct TreeArchiveClient {
+        script: std::collections::HashMap<&'static str, TreeStep>,
+        calls: Arc<Mutex<Vec<(String, PathBuf, Option<String>)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ArchiveExtractorClient for TreeArchiveClient {
+        async fn process(
+            &self,
+            request: ArchivePluginProcessRequest,
+        ) -> AppResult<ArchivePluginProcessResponse> {
+            let ArchivePluginOperation::ExtractArchive {
+                archive_path,
+                output_dir,
+                password,
+                ..
+            } = request.operation
+            else {
+                panic!("expected an extract operation");
+            };
+            let name = Path::new(&archive_path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let output_dir = PathBuf::from(output_dir);
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.clone(), output_dir.clone(), password.clone()));
+            fs::write(output_dir.join("partial.part"), b"partial").unwrap();
+
+            let answer = |status| ArchivePluginProcessResponse {
+                status,
+                files: Vec::new(),
+                expanded_bytes: None,
+                copied_bytes: None,
+                staged_bytes: None,
+                error_code: None,
+                message: None,
+            };
+            let emitted: Vec<(&str, &[u8])> =
+                match self.script.get(name.as_str()).expect("unscripted archive") {
+                    TreeStep::Emits(members) => members.clone(),
+                    TreeStep::Fails => {
+                        return Ok(ArchivePluginProcessResponse {
+                            error_code: Some("corrupt_archive".to_string()),
+                            ..answer(ArchivePluginStatus::Failed)
+                        });
+                    }
+                    TreeStep::Locked(accepted) => match password.as_deref() {
+                        Some(given) if given == *accepted => {
+                            vec![("unlocked.mkv", b"video".as_slice())]
+                        }
+                        Some(_) => return Ok(answer(ArchivePluginStatus::PasswordInvalid)),
+                        None => return Ok(answer(ArchivePluginStatus::PasswordRequired)),
+                    },
+                };
+            let mut files = Vec::new();
+            for (relative_path, bytes) in emitted {
+                fs::write(output_dir.join(relative_path), bytes).unwrap();
+                files.push(ArchivePluginExtractedFile {
+                    relative_path: relative_path.to_string(),
+                    size: Some(bytes.len() as u64),
+                    checksum: None,
+                });
+            }
+            Ok(ArchivePluginProcessResponse {
+                files,
+                ..answer(ArchivePluginStatus::Ok)
+            })
+        }
+    }
+
+    struct TreeRun {
+        result: AppResult<Option<PathBuf>>,
+        calls: Vec<(String, PathBuf, Option<String>)>,
+        source: tempfile::TempDir,
+        destination: tempfile::TempDir,
+    }
+
+    impl TreeRun {
+        fn staging_dirs(&self) -> Vec<PathBuf> {
+            fs::read_dir(self.destination.path())
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| is_archive_staging_dir(path))
+                .collect()
+        }
+
+        /// The download and the unrelated file beside the staging area are
+        /// exactly as they were before the extraction.
+        fn assert_unrelated_files_preserved(&self, archives: &[&str]) {
+            for archive in archives {
+                assert_eq!(
+                    fs::read(self.source.path().join(archive)).unwrap(),
+                    b"archive",
+                    "{archive}"
+                );
+            }
+            assert_eq!(
+                fs::read(self.source.path().join("quiet.harbor.nfo")).unwrap(),
+                b"info"
+            );
+            assert_eq!(
+                fs::read(self.destination.path().join("unrelated.mkv")).unwrap(),
+                b"keep me"
+            );
+        }
+    }
+
+    async fn run_tree(
+        archives: &[&str],
+        script: Vec<(&'static str, TreeStep)>,
+        candidates: &ArchivePasswordCandidates,
+    ) -> TreeRun {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        for archive in archives {
+            let path = source.path().join(archive);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"archive").unwrap();
+        }
+        fs::write(source.path().join("quiet.harbor.nfo"), b"info").unwrap();
+        fs::write(destination.path().join("unrelated.mkv"), b"keep me").unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let client: Arc<dyn ArchiveExtractorClient> = Arc::new(TreeArchiveClient {
+            script: script.into_iter().collect(),
+            calls: Arc::clone(&calls),
+        });
+        let provider: Arc<dyn ArchiveExtractorPluginProvider> =
+            Arc::new(RecordingArchiveProvider {
+                client,
+                formats: vec![
+                    ArchivePluginFormat::Rar,
+                    ArchivePluginFormat::SevenZip,
+                    ArchivePluginFormat::Zip,
+                ],
+            });
+
+        let result = extract_archives_if_needed(
+            source.path(),
+            is_sample_named_file,
+            Some(ArchiveExtractionDestination::new(
+                destination.path(),
+                "archive-tree",
+            )),
+            candidates,
+            Some(provider),
+        )
+        .await;
+        let calls = calls.lock().unwrap().clone();
+        TreeRun {
+            result,
+            calls,
+            source,
+            destination,
+        }
+    }
+
+    fn call_names(run: &TreeRun) -> Vec<&str> {
+        run.calls.iter().map(|(name, _, _)| name.as_str()).collect()
+    }
+
+    fn relative_files(root: &Path) -> Vec<String> {
+        let mut files = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    files.push(
+                        path.strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    #[tokio::test]
+    async fn every_archive_set_of_a_season_pack_is_extracted_into_its_own_directory() {
+        let run = run_tree(
+            &[
+                "quiet.harbor.s01e01.rar",
+                "quiet.harbor.s01e02.rar",
+                "Extras/quiet.harbor.extras.zip",
+            ],
+            vec![
+                (
+                    "quiet.harbor.s01e01.rar",
+                    TreeStep::Emits(vec![("quiet.harbor.s01e01.mkv", b"one")]),
+                ),
+                (
+                    "quiet.harbor.s01e02.rar",
+                    TreeStep::Emits(vec![("quiet.harbor.s01e02.mkv", b"two")]),
+                ),
+                (
+                    "quiet.harbor.extras.zip",
+                    TreeStep::Emits(vec![("cover.jpg", b"jpg")]),
+                ),
+            ],
+            &ArchivePasswordCandidates::default(),
+        )
+        .await;
+
+        let root = run
+            .result
+            .as_ref()
+            .unwrap()
+            .clone()
+            .expect("video extracted");
+        assert_eq!(run.staging_dirs(), vec![root.clone()]);
+        assert_eq!(
+            call_names(&run),
+            [
+                "quiet.harbor.s01e01.rar",
+                "quiet.harbor.s01e02.rar",
+                "quiet.harbor.extras.zip"
+            ]
+        );
+        // A set without video keeps its output; so does every other set.
+        assert_eq!(
+            relative_files(&root),
+            [
+                "out-2/partial.part",
+                "out-2/quiet.harbor.s01e02.mkv",
+                "out-3/cover.jpg",
+                "out-3/partial.part",
+                "out/partial.part",
+                "out/quiet.harbor.s01e01.mkv",
+            ]
+        );
+        run.assert_unrelated_files_preserved(&[
+            "quiet.harbor.s01e01.rar",
+            "quiet.harbor.s01e02.rar",
+            "Extras/quiet.harbor.extras.zip",
+        ]);
+    }
+
+    #[tokio::test]
+    async fn one_failing_set_removes_the_whole_workspace_and_nothing_else() {
+        let run = run_tree(
+            &["quiet.harbor.s01e01.rar", "quiet.harbor.s01e02.rar"],
+            vec![
+                (
+                    "quiet.harbor.s01e01.rar",
+                    TreeStep::Emits(vec![("quiet.harbor.s01e01.mkv", b"one")]),
+                ),
+                ("quiet.harbor.s01e02.rar", TreeStep::Fails),
+            ],
+            &ArchivePasswordCandidates::default(),
+        )
+        .await;
+
+        let error = run.result.as_ref().unwrap_err();
+        assert!(error.to_string().contains("corrupt_archive"), "{error}");
+        assert_eq!(run.calls.len(), 2);
+        assert!(run.staging_dirs().is_empty());
+        run.assert_unrelated_files_preserved(&[
+            "quiet.harbor.s01e01.rar",
+            "quiet.harbor.s01e02.rar",
+        ]);
+    }
+
+    #[tokio::test]
+    async fn a_locked_second_set_is_opened_by_a_candidate_and_keeps_only_its_final_output() {
+        let run = run_tree(
+            &["quiet.harbor.s01e01.rar", "quiet.harbor.s01e02.rar"],
+            vec![
+                (
+                    "quiet.harbor.s01e01.rar",
+                    TreeStep::Emits(vec![("quiet.harbor.s01e01.mkv", b"one")]),
+                ),
+                (
+                    "quiet.harbor.s01e02.rar",
+                    TreeStep::Locked("indexer-secret"),
+                ),
+            ],
+            &operator_indexer_and_name_candidates(),
+        )
+        .await;
+
+        let root = run
+            .result
+            .as_ref()
+            .unwrap()
+            .clone()
+            .expect("video extracted");
+        let passwords: Vec<_> = run
+            .calls
+            .iter()
+            .map(|(name, _, password)| (name.as_str(), password.as_deref()))
+            .collect();
+        assert_eq!(
+            passwords,
+            [
+                ("quiet.harbor.s01e01.rar", None),
+                ("quiet.harbor.s01e02.rar", None),
+                ("quiet.harbor.s01e02.rar", Some("typed-guess")),
+                ("quiet.harbor.s01e02.rar", Some("indexer-secret")),
+            ]
+        );
+        // Only the accepted attempt's output remains in the second set's
+        // directory; the first set's output was never touched.
+        assert_eq!(
+            relative_files(&root),
+            [
+                "out-2/partial.part",
+                "out-2/unlocked.mkv",
+                "out/partial.part",
+                "out/quiet.harbor.s01e01.mkv",
+            ]
+        );
+        run.assert_unrelated_files_preserved(&[
+            "quiet.harbor.s01e01.rar",
+            "quiet.harbor.s01e02.rar",
+        ]);
+    }
+
+    #[tokio::test]
+    async fn an_archive_inside_an_archive_is_extracted_and_left_in_place() {
+        let run = run_tree(
+            &["quiet.harbor.s01e01.rar"],
+            vec![
+                (
+                    "quiet.harbor.s01e01.rar",
+                    TreeStep::Emits(vec![("quiet.harbor.s01e01.zip", b"inner")]),
+                ),
+                (
+                    "quiet.harbor.s01e01.zip",
+                    TreeStep::Emits(vec![("quiet.harbor.s01e01.mkv", b"video")]),
+                ),
+            ],
+            &ArchivePasswordCandidates::default(),
+        )
+        .await;
+
+        let root = run
+            .result
+            .as_ref()
+            .unwrap()
+            .clone()
+            .expect("video extracted");
+        let (_, inner_output, _) = &run.calls[1];
+        assert_eq!(inner_output, &root.join("nested-1-1"));
+        assert_eq!(
+            relative_files(&root),
+            [
+                "nested-1-1/partial.part",
+                "nested-1-1/quiet.harbor.s01e01.mkv",
+                "out/partial.part",
+                "out/quiet.harbor.s01e01.zip",
+            ]
+        );
+        run.assert_unrelated_files_preserved(&["quiet.harbor.s01e01.rar"]);
+    }
+
+    #[tokio::test]
+    async fn archives_nested_past_the_limit_without_video_fail_and_are_cleaned_up() {
+        let run = run_tree(
+            &["level0.rar"],
+            vec![
+                ("level0.rar", TreeStep::Emits(vec![("level1.rar", b"a")])),
+                ("level1.rar", TreeStep::Emits(vec![("level2.rar", b"b")])),
+                ("level2.rar", TreeStep::Emits(vec![("level3.rar", b"c")])),
+            ],
+            &ArchivePasswordCandidates::default(),
+        )
+        .await;
+
+        let error = run.result.as_ref().unwrap_err();
+        assert!(error.to_string().contains("nested more than"), "{error}");
+        assert_eq!(call_names(&run), ["level0.rar", "level1.rar", "level2.rar"]);
+        assert!(run.staging_dirs().is_empty());
+        run.assert_unrelated_files_preserved(&["level0.rar"]);
+    }
+
+    #[tokio::test]
+    async fn archives_nested_past_the_limit_are_left_when_other_sets_hold_video() {
+        let run = run_tree(
+            &["a.rar", "level0.rar"],
+            vec![
+                (
+                    "a.rar",
+                    TreeStep::Emits(vec![("quiet.harbor.mkv", b"video")]),
+                ),
+                ("level0.rar", TreeStep::Emits(vec![("level1.rar", b"a")])),
+                ("level1.rar", TreeStep::Emits(vec![("level2.rar", b"b")])),
+                ("level2.rar", TreeStep::Emits(vec![("level3.rar", b"c")])),
+            ],
+            &ArchivePasswordCandidates::default(),
+        )
+        .await;
+
+        let root = run
+            .result
+            .as_ref()
+            .unwrap()
+            .clone()
+            .expect("video extracted");
+        assert_eq!(
+            call_names(&run),
+            ["a.rar", "level0.rar", "level1.rar", "level2.rar"]
+        );
+        assert!(root.join("nested-2-1/level3.rar").is_file());
+        run.assert_unrelated_files_preserved(&["a.rar", "level0.rar"]);
+    }
+
+    #[tokio::test]
+    async fn too_many_nested_archives_fail_and_are_cleaned_up() {
+        const INNER: [&str; MAX_NESTED_ARCHIVES + 1] = [
+            "inner01.zip",
+            "inner02.zip",
+            "inner03.zip",
+            "inner04.zip",
+            "inner05.zip",
+            "inner06.zip",
+            "inner07.zip",
+            "inner08.zip",
+            "inner09.zip",
+            "inner10.zip",
+            "inner11.zip",
+            "inner12.zip",
+            "inner13.zip",
+            "inner14.zip",
+            "inner15.zip",
+            "inner16.zip",
+            "inner17.zip",
+        ];
+        let run = run_tree(
+            &["outer.rar"],
+            vec![(
+                "outer.rar",
+                TreeStep::Emits(
+                    INNER
+                        .iter()
+                        .map(|name| (*name, b"zip".as_slice()))
+                        .collect(),
+                ),
+            )],
+            &ArchivePasswordCandidates::default(),
+        )
+        .await;
+
+        let error = run.result.as_ref().unwrap_err();
+        assert!(error.to_string().contains("nested archives"), "{error}");
+        assert_eq!(call_names(&run), ["outer.rar"]);
+        assert!(run.staging_dirs().is_empty());
+        run.assert_unrelated_files_preserved(&["outer.rar"]);
+    }
+
+    #[tokio::test]
+    async fn sets_without_video_anywhere_leave_no_workspace() {
+        let run = run_tree(
+            &["quiet.harbor.rar", "quiet.harbor.extras.rar"],
+            vec![
+                (
+                    "quiet.harbor.rar",
+                    TreeStep::Emits(vec![("readme.txt", b"txt")]),
+                ),
+                (
+                    "quiet.harbor.extras.rar",
+                    TreeStep::Emits(vec![("cover.jpg", b"jpg")]),
+                ),
+            ],
+            &ArchivePasswordCandidates::default(),
+        )
+        .await;
+
+        assert!(run.result.as_ref().unwrap().is_none());
+        assert_eq!(run.calls.len(), 2);
+        assert!(run.staging_dirs().is_empty());
+        run.assert_unrelated_files_preserved(&["quiet.harbor.rar", "quiet.harbor.extras.rar"]);
+    }
+
+    #[test]
+    fn find_archive_sets_lists_every_set_top_level_first() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("b.rar"), b"rar").unwrap();
+        fs::write(dir.path().join("a.part1.rar"), b"rar").unwrap();
+        fs::write(dir.path().join("a.part2.rar"), b"rar").unwrap();
+        fs::create_dir_all(dir.path().join("Disc2")).unwrap();
+        fs::write(dir.path().join("Disc2/disc2.7z"), b"7z").unwrap();
+        fs::create_dir_all(dir.path().join("Sample")).unwrap();
+        fs::write(dir.path().join("Sample/sample.rar"), b"rar").unwrap();
+
+        let names: Vec<_> = find_archive_sets(dir.path())
+            .into_iter()
+            .map(|(path, _)| {
+                path.strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(names, ["a.part1.rar", "b.rar", "Disc2/disc2.7z"]);
+    }
+
+    #[test]
+    fn output_caps_count_across_every_set_of_a_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("quiet.harbor.mkv"), b"video").unwrap();
+        let response = ArchivePluginProcessResponse {
+            status: ArchivePluginStatus::Ok,
+            files: Vec::new(),
+            expanded_bytes: None,
+            copied_bytes: None,
+            staged_bytes: None,
+            error_code: None,
+            message: None,
+        };
+
+        let totals =
+            validate_archive_plugin_output(dir.path(), &response, PluginOutputTotals::default())
+                .unwrap();
+        assert_eq!((totals.files, totals.directories, totals.bytes), (1, 1, 5));
+
+        let near_file_cap = PluginOutputTotals {
+            files: MAX_PLUGIN_OUTPUT_FILES,
+            ..totals
+        };
+        let error =
+            validate_archive_plugin_output(dir.path(), &response, near_file_cap).unwrap_err();
+        assert!(error.to_string().contains("too many files"), "{error}");
+
+        let near_byte_cap = PluginOutputTotals {
+            bytes: MAX_PLUGIN_OUTPUT_BYTES - 1,
+            ..totals
+        };
+        let error =
+            validate_archive_plugin_output(dir.path(), &response, near_byte_cap).unwrap_err();
+        assert!(error.to_string().contains("exceeds"), "{error}");
+    }
+
+    #[test]
+    fn an_archive_source_inside_its_own_output_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("out");
+        fs::create_dir_all(output.join("inner")).unwrap();
+        let sibling = root.path().join("source");
+        fs::create_dir_all(&sibling).unwrap();
+
+        assert!(ensure_source_outside_output(&output, &output).is_err());
+        assert!(ensure_source_outside_output(&output.join("inner"), &output).is_err());
+        assert!(ensure_source_outside_output(&sibling, &output).is_ok());
+        assert!(ensure_source_outside_output(root.path(), &output).is_ok());
+    }
+
+    #[tokio::test]
+    async fn discarding_an_output_touches_only_output_directories_of_a_staging_workspace() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join(".scryer-ax-0123456789abcdef");
+        let plain = parent.path().join("Quiet.Harbor.S01");
+        for dir in [
+            workspace.join("out-2"),
+            workspace.join("nested-1-3"),
+            workspace.join("keep"),
+            plain.join("out"),
+        ] {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("file.mkv"), b"video").unwrap();
+        }
+
+        discard_workspace_output_dir(&workspace, &workspace.join("out-2")).await;
+        discard_workspace_output_dir(&workspace, &workspace.join("nested-1-3")).await;
+        discard_workspace_output_dir(&workspace, &workspace.join("keep")).await;
+        discard_workspace_output_dir(&workspace, &workspace.join("keep/..")).await;
+        discard_workspace_output_dir(&workspace, &workspace).await;
+        discard_workspace_output_dir(&plain, &plain.join("out")).await;
+        discard_workspace_output_dir(&workspace, &plain.join("out")).await;
+
+        assert!(!workspace.join("out-2").exists());
+        assert!(!workspace.join("nested-1-3").exists());
+        assert!(workspace.join("keep/file.mkv").is_file());
+        assert!(plain.join("out/file.mkv").is_file());
+    }
+
+    #[tokio::test]
+    async fn output_directories_are_only_prepared_inside_the_workspace_and_empty() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join(".scryer-ax-0123456789abcdef");
+        fs::create_dir_all(workspace.join("out")).unwrap();
+
+        prepare_workspace_output_dir(&workspace, &workspace.join("out"))
+            .await
+            .unwrap();
+        prepare_workspace_output_dir(&workspace, &workspace.join("out-2"))
+            .await
+            .unwrap();
+        assert!(workspace.join("out-2").is_dir());
+
+        fs::write(workspace.join("out/leftover.mkv"), b"video").unwrap();
+        assert!(
+            prepare_workspace_output_dir(&workspace, &workspace.join("out"))
+                .await
+                .is_err()
+        );
+        assert!(
+            prepare_workspace_output_dir(&workspace, &parent.path().join("out"))
+                .await
+                .is_err()
+        );
+        assert!(!parent.path().join("out").exists());
+        assert!(workspace.join("out/leftover.mkv").is_file());
     }
 }
