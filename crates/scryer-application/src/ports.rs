@@ -3264,6 +3264,19 @@ pub trait UserRepository: Send + Sync {
         }))
     }
     async fn create(&self, user: User) -> AppResult<User>;
+    async fn bootstrap_seed_is_uninitialized(&self, _id: &str) -> AppResult<bool> {
+        Ok(false)
+    }
+    async fn create_bootstrap_admin(
+        &self,
+        _user: User,
+        _grants: Vec<LibraryGrant>,
+        _initialize_seed: bool,
+    ) -> AppResult<User> {
+        Err(AppError::Repository(
+            "atomic administrator bootstrap is not configured".into(),
+        ))
+    }
     async fn list_all(&self) -> AppResult<Vec<User>>;
     async fn get_by_id(&self, id: &str) -> AppResult<Option<User>>;
     async fn auth_session_version(&self, user_id: &str) -> AppResult<Option<String>>;
