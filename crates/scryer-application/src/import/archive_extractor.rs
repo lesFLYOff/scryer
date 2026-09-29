@@ -122,8 +122,9 @@ impl ArchiveType {
 /// Every archive set the download holds is extracted into its own output
 /// directory of one workspace, and an output that holds no importable video
 /// but does hold archives has those extracted too, a bounded number of levels
-/// deep. Any set that fails fails the whole extraction and the workspace is
-/// removed: the import never proceeds on part of a download.
+/// deep. A set that fails is skipped when the rest of the download yields
+/// importable video; when nothing does, the first failure is returned and the
+/// workspace is removed.
 ///
 /// Each set is first attempted without a password. Only when the plugin
 /// answers that it needs one (or that the one given is wrong) are the
@@ -198,6 +199,11 @@ pub async fn extract_archives_if_needed(
 
 /// Extracts every set, then any archives found in outputs that hold no
 /// importable video. Returns whether the workspace ended up holding video.
+///
+/// A set that fails is skipped and its output discarded, so one broken or
+/// locked archive does not cost the import the video its siblings hold. The
+/// first failure is returned when no set yields importable video. A timeout is
+/// never skipped past: the remaining sets would each wait it out again.
 async fn extract_into_workspace(
     workspace: &ArchiveExtractionWorkspace,
     sets: Vec<(PathBuf, ArchiveType)>,
@@ -206,6 +212,7 @@ async fn extract_into_workspace(
     provider: &Arc<dyn ArchiveExtractorPluginProvider>,
 ) -> AppResult<bool> {
     let mut totals = PluginOutputTotals::default();
+    let mut first_failure = None;
     let mut pass_outputs = Vec::with_capacity(sets.len());
     for (index, (archive_path, archive_type)) in sets.into_iter().enumerate() {
         let output_dir = if index == 0 {
@@ -223,8 +230,9 @@ async fn extract_into_workspace(
             passwords,
             provider,
         };
-        set.extract(&mut totals).await?;
-        pass_outputs.push(output_dir);
+        if set.extract_or_skip(&mut totals, &mut first_failure).await? {
+            pass_outputs.push(output_dir);
+        }
     }
 
     let mut nested_archives = 0usize;
@@ -274,13 +282,17 @@ async fn extract_into_workspace(
                 passwords,
                 provider,
             };
-            set.extract(&mut totals).await?;
-            next_outputs.push(output_dir);
+            if set.extract_or_skip(&mut totals, &mut first_failure).await? {
+                next_outputs.push(output_dir);
+            }
         }
         pass_outputs = next_outputs;
     }
 
-    Ok(has_video_files(&workspace.root))
+    match first_failure {
+        Some(error) if !has_importable_video_files(&workspace.root, is_sample) => Err(error),
+        _ => Ok(has_video_files(&workspace.root)),
+    }
 }
 
 /// The archive sets inside the given extraction outputs whose own output holds
@@ -328,6 +340,29 @@ struct ArchiveSetExtraction<'a> {
 }
 
 impl ArchiveSetExtraction<'_> {
+    /// Extracts the set, or on a failure other than a timeout discards its
+    /// output, keeps the first such failure and reports the set as skipped.
+    async fn extract_or_skip(
+        &self,
+        totals: &mut PluginOutputTotals,
+        first_failure: &mut Option<AppError>,
+    ) -> AppResult<bool> {
+        match self.extract(totals).await {
+            Ok(()) => Ok(true),
+            Err(error) if is_timeout_error(&error) => Err(error),
+            Err(error) => {
+                discard_workspace_output_dir(&self.workspace.root, self.output_dir).await;
+                tracing::warn!(
+                    archive = %self.archive_path.display(),
+                    error = %error,
+                    "skipping an archive set that failed to extract"
+                );
+                first_failure.get_or_insert(error);
+                Ok(false)
+            }
+        }
+    }
+
     async fn extract(&self, totals: &mut PluginOutputTotals) -> AppResult<()> {
         let result = self.extract_with_candidates(totals).await;
         match result {
@@ -2689,15 +2724,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_failing_set_removes_the_whole_workspace_and_nothing_else() {
+    async fn a_failing_set_is_skipped_when_another_set_yields_video() {
         let run = run_tree(
-            &["quiet.harbor.s01e01.rar", "quiet.harbor.s01e02.rar"],
+            &[
+                "quiet.harbor.s01e01.rar",
+                "quiet.harbor.s01e02.rar",
+                "quiet.harbor.s01e03.rar",
+            ],
             vec![
+                ("quiet.harbor.s01e01.rar", TreeStep::Fails),
                 (
-                    "quiet.harbor.s01e01.rar",
-                    TreeStep::Emits(vec![("quiet.harbor.s01e01.mkv", b"one")]),
+                    "quiet.harbor.s01e02.rar",
+                    TreeStep::Emits(vec![("quiet.harbor.s01e02.mkv", b"two")]),
                 ),
-                ("quiet.harbor.s01e02.rar", TreeStep::Fails),
+                ("quiet.harbor.s01e03.rar", TreeStep::Locked("unknown")),
+            ],
+            &ArchivePasswordCandidates::default(),
+        )
+        .await;
+
+        let root = run
+            .result
+            .as_ref()
+            .unwrap()
+            .clone()
+            .expect("video extracted");
+        assert_eq!(run.calls.len(), 3);
+        assert_eq!(run.staging_dirs(), vec![root.clone()]);
+        // The skipped sets leave nothing behind, not even a partial member.
+        assert_eq!(
+            relative_files(&root),
+            ["out-2/partial.part", "out-2/quiet.harbor.s01e02.mkv"]
+        );
+        run.assert_unrelated_files_preserved(&[
+            "quiet.harbor.s01e01.rar",
+            "quiet.harbor.s01e02.rar",
+            "quiet.harbor.s01e03.rar",
+        ]);
+    }
+
+    #[tokio::test]
+    async fn the_first_failure_is_returned_when_no_set_yields_video() {
+        let run = run_tree(
+            &[
+                "quiet.harbor.s01e01.rar",
+                "quiet.harbor.s01e02.rar",
+                "Extras/quiet.harbor.extras.zip",
+            ],
+            vec![
+                ("quiet.harbor.s01e01.rar", TreeStep::Fails),
+                ("quiet.harbor.s01e02.rar", TreeStep::Locked("unknown")),
+                (
+                    "quiet.harbor.extras.zip",
+                    TreeStep::Emits(vec![("cover.jpg", b"jpg")]),
+                ),
             ],
             &ArchivePasswordCandidates::default(),
         )
@@ -2705,11 +2785,12 @@ mod tests {
 
         let error = run.result.as_ref().unwrap_err();
         assert!(error.to_string().contains("corrupt_archive"), "{error}");
-        assert_eq!(run.calls.len(), 2);
+        assert_eq!(run.calls.len(), 3);
         assert!(run.staging_dirs().is_empty());
         run.assert_unrelated_files_preserved(&[
             "quiet.harbor.s01e01.rar",
             "quiet.harbor.s01e02.rar",
+            "Extras/quiet.harbor.extras.zip",
         ]);
     }
 
