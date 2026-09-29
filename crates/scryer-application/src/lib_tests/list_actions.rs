@@ -368,8 +368,13 @@ async fn act_for_owner(
     let mut item = resolved_item("alpha");
     item.external_ids = vec![ExternalId::new("tvdb", tvdb_id.to_string())];
 
-    let outcome =
-        crate::lists::act::act_on_candidate(&AppListActions::new(&harness.app), &list, &item).await;
+    let outcome = crate::lists::act::act_on_candidate(
+        &AppListActions::new(&harness.app),
+        &list,
+        &item,
+        false,
+    )
+    .await;
     (harness, outcome)
 }
 

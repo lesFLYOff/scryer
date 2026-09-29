@@ -380,6 +380,86 @@ async fn a_member_with_lists_turned_off_is_not_read() {
     );
 }
 
+/// A personal Request list with a linked account for its owner.
+fn personal_request_harness(policy: Option<ListPolicy>) -> Harness {
+    let list = ListSubscription {
+        scope: ListScope::Personal,
+        mode: ListMode::Request,
+        credential_id: Some("account-one".to_string()),
+        ..subscription("list-a")
+    };
+    let harness = Harness::new(vec![list]);
+    harness
+        .store
+        .accounts
+        .lock()
+        .unwrap()
+        .push(scryer_domain::UserListAccount {
+            id: "account-one".to_string(),
+            user_id: "owner-one".to_string(),
+            provider: crate::lists::test_support::PROVIDER.to_string(),
+            external_user_id: "external-one".to_string(),
+            username: "fixture-member".to_string(),
+            display_name: None,
+            credential: scryer_domain::ListAccountCredential {
+                access_token: "fixture-token".to_string(),
+                ..scryer_domain::ListAccountCredential::default()
+            },
+            status: scryer_domain::UserListAccountStatus::Active,
+            error_message: None,
+            linked_at: at(0),
+            last_used_at: None,
+            last_refresh_at: None,
+            updated_at: at(0),
+        });
+    if let Some(policy) = policy {
+        harness.store.policies.lock().unwrap().push(UserListPolicy {
+            user_id: "owner-one".to_string(),
+            policy,
+            updated_by_user_id: None,
+            updated_at: at(0),
+        });
+    }
+    harness.lists.serve("list-a", &["alpha"]);
+    harness
+}
+
+fn request_holds(harness: &Harness) -> Vec<bool> {
+    harness
+        .actions
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            RecordedAction::Request { hold, .. } => Some(hold),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_member_whose_list_policy_needs_approval_gets_held_requests() {
+    for policy in [None, Some(ListPolicy::Approval)] {
+        let harness = personal_request_harness(policy);
+
+        harness.sync_at(at(0)).await;
+
+        assert_eq!(request_holds(&harness), vec![true], "policy {policy:?}");
+        assert_eq!(
+            harness.store.row("list-a", "alpha").state,
+            ListMembershipState::Requested
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_member_whose_list_policy_auto_approves_gets_evaluated_requests() {
+    let harness = personal_request_harness(Some(ListPolicy::Auto));
+
+    harness.sync_at(at(0)).await;
+
+    assert_eq!(request_holds(&harness), vec![false]);
+}
+
 #[tokio::test]
 async fn a_personal_list_without_an_account_fails_without_fetching() {
     let list = ListSubscription {
@@ -467,6 +547,7 @@ async fn a_personal_add_list_submits_requests_instead() {
         &actions,
         &list,
         &crate::lists::test_support::resolved_item("alpha"),
+        false,
     )
     .await;
     assert_eq!(outcome.state, ListMembershipState::Requested);

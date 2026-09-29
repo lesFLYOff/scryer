@@ -218,15 +218,18 @@ pub async fn sync_subscription(
     let mut run = ListSyncRun::started(subscription.id.clone(), job_run_id);
     run.started_at = now;
 
-    if subscription.scope == ListScope::Personal
-        && context
-            .policies
-            .get(&subscription.owner_user_id)
-            .await?
-            .map(|policy| policy.policy)
-            .unwrap_or_default()
-            == ListPolicy::None
-    {
+    let owner_policy = match subscription.scope {
+        ListScope::Personal => Some(
+            context
+                .policies
+                .get(&subscription.owner_user_id)
+                .await?
+                .map(|policy| policy.policy)
+                .unwrap_or_default(),
+        ),
+        ListScope::Public => None,
+    };
+    if owner_policy == Some(ListPolicy::None) {
         let status = ListSyncStatus {
             state: ListSyncState::Off,
             next_at: Some(next_sync_at(subscription, now)),
@@ -322,6 +325,9 @@ pub async fn sync_subscription(
     let exclusions = context.exclusions.list().await?;
     let evaluated = evaluate(subscription, resolved, &exclusions, &existing);
 
+    // A member whose list policy needs approval gets requests that wait for
+    // review, whatever their grants and the request rules would allow.
+    let hold_requests = owner_policy == Some(ListPolicy::Approval);
     let mut rows = Vec::with_capacity(evaluated.len());
     for evaluated in evaluated {
         let previous = existing.get(&evaluated.item.item.item_key);
@@ -346,8 +352,13 @@ pub async fn sync_subscription(
             ItemDecision::Unresolved => row.state = ListMembershipState::Unresolved,
             ItemDecision::Deferred => row.state = ListMembershipState::Pending,
             ItemDecision::Candidate => {
-                let outcome =
-                    act_on_candidate(context.actions, subscription, &evaluated.item).await;
+                let outcome = act_on_candidate(
+                    context.actions,
+                    subscription,
+                    &evaluated.item,
+                    hold_requests,
+                )
+                .await;
                 row.state = outcome.state;
                 row.state_reason = outcome.reason;
                 row.added_by_list |= outcome.added_by_list;
