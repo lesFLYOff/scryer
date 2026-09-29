@@ -1,7 +1,10 @@
+use crate::location::model::VerificationDepth;
+use crate::location::verify::{
+    CopyProgress, DestinationClaim, VerifiedCopier, VerifiedCopyRequest, hash_existing_file,
+};
 use crate::{AppError, AppResult};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
@@ -1645,88 +1648,23 @@ pub(crate) struct RecycleRelocationPlan {
     pub targets: Vec<RecycleRelocationTarget>,
 }
 
-/// Size and full-content BLAKE3 digest of one file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RelocationFileDigest {
-    size: u64,
-    blake3: blake3::Hash,
-}
-
-/// The file operations a relocation uses, replaceable so tests can force the
-/// copy path and inject copy or verification failures.
-#[derive(Clone, Copy)]
+/// How a relocation moves an entry, replaceable so tests can force the copy
+/// path and inject verification failures.
+#[derive(Clone)]
 struct RelocationOps {
     /// Try an atomic no-replace rename before copying.
     allow_rename: bool,
-    /// Copy `source` onto a `dest` that does not exist yet, returning the
-    /// digest of the bytes read from `source`.
-    copy_file: fn(&Path, &Path) -> std::io::Result<RelocationFileDigest>,
-    /// Digest of a file as it is on disk.
-    digest_file: fn(&Path) -> std::io::Result<RelocationFileDigest>,
+    /// Copies and proves each file of an entry that cannot be renamed.
+    copier: VerifiedCopier,
 }
 
 impl Default for RelocationOps {
     fn default() -> Self {
         Self {
             allow_rename: true,
-            copy_file: copy_file_with_digest,
-            digest_file,
+            copier: VerifiedCopier::new(),
         }
     }
-}
-
-const RELOCATION_COPY_BUFFER_BYTES: usize = 1024 * 1024;
-
-fn copy_file_with_digest(source: &Path, dest: &Path) -> std::io::Result<RelocationFileDigest> {
-    use std::io::{Read, Write};
-
-    let mut source_file = std::fs::File::open(source)?;
-    let mut dest_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dest)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0u8; RELOCATION_COPY_BUFFER_BYTES];
-    let mut size = 0u64;
-    loop {
-        let read = source_file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        dest_file.write_all(&buffer[..read])?;
-        size += read as u64;
-    }
-    dest_file.flush()?;
-    dest_file.sync_all()?;
-    if let Ok(metadata) = source_file.metadata() {
-        let _ = dest_file.set_permissions(metadata.permissions());
-    }
-    Ok(RelocationFileDigest {
-        size,
-        blake3: hasher.finalize(),
-    })
-}
-
-fn digest_file(path: &Path) -> std::io::Result<RelocationFileDigest> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0u8; RELOCATION_COPY_BUFFER_BYTES];
-    let mut size = 0u64;
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        size += read as u64;
-    }
-    Ok(RelocationFileDigest {
-        size,
-        blake3: hasher.finalize(),
-    })
 }
 
 /// Move every committed entry of each plan's previous bin to its new bin.
@@ -1845,7 +1783,7 @@ async fn relocate_plan(
             continue;
         }
 
-        match relocate_entry(&entry_dir, &target.join(&entry_id), &manifest, ops).await {
+        match relocate_entry(&entry_dir, &target.join(&entry_id), &manifest, &ops).await {
             Ok(RelocatedEntry::Moved) => report.moved_count += 1,
             Ok(RelocatedEntry::MovedWithLeftovers(reason)) => {
                 report.moved_count += 1;
@@ -1948,7 +1886,7 @@ async fn relocate_entry(
     entry_dir: &Path,
     dest: &Path,
     manifest: &RecycleManifest,
-    ops: RelocationOps,
+    ops: &RelocationOps,
 ) -> Result<RelocatedEntry, String> {
     match tokio::fs::symlink_metadata(dest).await {
         Ok(_) => return Err(relocation_collision(dest)),
@@ -1985,14 +1923,7 @@ async fn relocate_entry(
         }
     }
 
-    let source = entry_dir.to_path_buf();
-    let destination = dest.to_path_buf();
-    let expected_manifest = manifest.clone();
-    tokio::task::spawn_blocking(move || {
-        copy_and_verify_entry(&source, &destination, &expected_manifest, ops)
-    })
-    .await
-    .map_err(|error| format!("the copy task failed: {error}"))??;
+    copy_and_verify_entry(entry_dir, dest, manifest, ops).await?;
 
     // The new copy is proven complete; only now does the previous one go.
     match crate::fs_safety::remove_dir_all_safely(entry_dir).await {
@@ -2014,17 +1945,17 @@ fn relocation_collision(dest: &Path) -> String {
 /// Copy `entry_dir` to a new `dest` and prove every file arrived intact. On
 /// failure the partial copy this call created is removed; the source is never
 /// touched.
-fn copy_and_verify_entry(
+async fn copy_and_verify_entry(
     entry_dir: &Path,
     dest: &Path,
     manifest: &RecycleManifest,
-    ops: RelocationOps,
+    ops: &RelocationOps,
 ) -> Result<(), String> {
-    let (dirs, files) = collect_entry_tree(entry_dir)?;
+    let (dirs, files) = collect_entry_tree_off_runtime(entry_dir).await?;
 
     // Creating the directory itself is the claim: it fails when anything
     // already holds the name, so the copy never lands in someone else's entry.
-    match std::fs::create_dir(dest) {
+    match tokio::fs::create_dir(dest).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(relocation_collision(dest));
@@ -2037,10 +1968,12 @@ fn copy_and_verify_entry(
         }
     }
 
-    let outcome = copy_entry_tree(entry_dir, dest, &dirs, &files, ops)
-        .and_then(|copied| verify_entry_copy(entry_dir, dest, &copied, manifest, ops));
+    let outcome = match copy_entry_tree(entry_dir, dest, &dirs, &files, ops).await {
+        Ok(()) => verify_entry_copy(dest, &files, manifest).await,
+        Err(reason) => Err(reason),
+    };
     if let Err(reason) = outcome {
-        return Err(match std::fs::remove_dir_all(dest) {
+        return Err(match tokio::fs::remove_dir_all(dest).await {
             Ok(()) => reason,
             Err(error) => format!(
                 "{reason}; the partial copy at {} could not be removed: {error}",
@@ -2049,6 +1982,15 @@ fn copy_and_verify_entry(
         });
     }
     Ok(())
+}
+
+async fn collect_entry_tree_off_runtime(
+    entry_dir: &Path,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let entry_dir = entry_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || collect_entry_tree(&entry_dir))
+        .await
+        .map_err(|error| format!("the copy task failed: {error}"))?
 }
 
 /// Relative directories and files of an entry. Anything other than plain
@@ -2091,72 +2033,80 @@ fn collect_entry_tree(entry_dir: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>), 
     Ok((dirs, files))
 }
 
-fn copy_entry_tree(
+/// Copy every file through the verified copier. A file counts only when its
+/// copy was read back in full and matched, and the source still holds the
+/// bytes that were copied.
+async fn copy_entry_tree(
     entry_dir: &Path,
     dest: &Path,
     dirs: &[PathBuf],
     files: &[PathBuf],
-    ops: RelocationOps,
-) -> Result<BTreeMap<PathBuf, RelocationFileDigest>, String> {
+    ops: &RelocationOps,
+) -> Result<(), String> {
     for dir in dirs {
         let target = dest.join(dir);
-        std::fs::create_dir(&target)
+        tokio::fs::create_dir(&target)
+            .await
             .map_err(|error| format!("could not create {}: {error}", target.display()))?;
     }
-    let mut copied = BTreeMap::new();
     for file in files {
         let source = entry_dir.join(file);
         let target = dest.join(file);
-        let digest = (ops.copy_file)(&source, &target).map_err(|error| {
-            format!(
-                "could not copy {} to {}: {error}",
-                source.display(),
+        let verified = ops
+            .copier
+            .copy_and_verify(VerifiedCopyRequest {
+                source: source.clone(),
+                destination: target.clone(),
+                depth: VerificationDepth::Full,
+                claim: DestinationClaim::ClaimHere,
+                progress: CopyProgress::none(),
+            })
+            .await
+            .map_err(|error| {
+                format!(
+                    "could not copy {} to {}: {error}",
+                    source.display(),
+                    target.display()
+                )
+            })?;
+        if !verified.permits_source_removal() || verified.depth.fell_back {
+            let detail = verified
+                .detail
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "verification failed: {} was not proven to match the entry's copy{detail}",
                 target.display()
-            )
-        })?;
-        copied.insert(file.clone(), digest);
+            ));
+        }
+        let source_now = hash_existing_file(&source)
+            .await
+            .map_err(|error| format!("could not re-check {}: {error}", source.display()))?;
+        if verified.hashes.as_ref() != Some(&source_now) {
+            return Err(format!(
+                "{} changed while it was being copied",
+                source.display()
+            ));
+        }
     }
-    Ok(copied)
+    Ok(())
 }
 
-fn verify_entry_copy(
-    entry_dir: &Path,
+async fn verify_entry_copy(
     dest: &Path,
-    copied: &BTreeMap<PathBuf, RelocationFileDigest>,
+    files: &[PathBuf],
     manifest: &RecycleManifest,
-    ops: RelocationOps,
 ) -> Result<(), String> {
-    let (_, dest_files) = collect_entry_tree(dest)?;
-    if dest_files.iter().collect::<Vec<_>>() != copied.keys().collect::<Vec<_>>() {
+    let (_, dest_files) = collect_entry_tree_off_runtime(dest).await?;
+    if dest_files != files {
         return Err(format!(
             "the copy at {} does not hold the same files as the entry",
             dest.display()
         ));
     }
-    for (file, source_digest) in copied {
-        // The source must still be the file that was copied, and the copy
-        // must match it byte for byte.
-        let source_size = std::fs::metadata(entry_dir.join(file))
-            .map_err(|error| format!("could not re-check {}: {error}", file.display()))?
-            .len();
-        if source_size != source_digest.size {
-            return Err(format!(
-                "{} changed while it was being copied",
-                entry_dir.join(file).display()
-            ));
-        }
-        let target = dest.join(file);
-        let dest_digest = (ops.digest_file)(&target)
-            .map_err(|error| format!("could not verify {}: {error}", target.display()))?;
-        if dest_digest != *source_digest {
-            return Err(format!(
-                "verification failed: {} does not match the entry's copy",
-                target.display()
-            ));
-        }
-    }
 
-    let manifest_bytes = std::fs::read(manifest_path(dest))
+    let manifest_bytes = tokio::fs::read(manifest_path(dest))
+        .await
         .map_err(|error| format!("could not read the copied manifest: {error}"))?;
     let copied_manifest: RecycleManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| format!("the copied manifest could not be parsed: {error}"))?;
@@ -2172,6 +2122,7 @@ fn verify_entry_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::location::verify::{ReadBackHandle, open_cache_bypassed};
     use tempfile::TempDir;
 
     fn test_config(dir: &Path) -> RecycleBinConfig {
@@ -3592,19 +3543,23 @@ mod tests {
         }
     }
 
-    fn payload_copy_fails(source: &Path, dest: &Path) -> std::io::Result<RelocationFileDigest> {
-        if dest.file_name().is_some_and(|name| name == "media.mkv") {
-            return Err(std::io::Error::other("injected copy failure"));
+    /// Copy-only relocation whose read-back of the payload is decided by
+    /// `payload`; every other file is read back normally.
+    fn ops_with_payload_read_back(
+        payload: impl Fn(&Path) -> ReadBackHandle + Send + Sync + 'static,
+    ) -> RelocationOps {
+        RelocationOps {
+            allow_rename: false,
+            copier: VerifiedCopier::with_read_back_opener(std::sync::Arc::new(
+                move |path: &Path| {
+                    if path.file_name().is_some_and(|name| name == "media.mkv") {
+                        payload(path)
+                    } else {
+                        open_cache_bypassed(path)
+                    }
+                },
+            )),
         }
-        copy_file_with_digest(source, dest)
-    }
-
-    fn payload_digest_mismatches(path: &Path) -> std::io::Result<RelocationFileDigest> {
-        let mut digest = digest_file(path)?;
-        if path.file_name().is_some_and(|name| name == "media.mkv") {
-            digest.blake3 = blake3::hash(b"not the recycled payload");
-        }
-        Ok(digest)
     }
 
     fn single_target_plan(from: &Path, to: &Path) -> RecycleRelocationPlan {
@@ -3718,6 +3673,9 @@ mod tests {
         );
     }
 
+    // The copy writes under a longer staging name first, so a file whose name
+    // is already near the limit cannot be copied.
+    #[cfg(unix)]
     #[tokio::test]
     async fn relocation_copy_failure_keeps_entry_and_removes_partial_copy() {
         let tmp = TempDir::new().unwrap();
@@ -3725,13 +3683,12 @@ mod tests {
         let new_bin = tmp.path().join("new-bin");
         let entry_id = "20310102_030405000_cfl111";
         let old_entry = seed_relocation_bin(&old_bin, entry_id).await;
+        tokio::fs::write(old_entry.join("z".repeat(250)), b"sidecar")
+            .await
+            .unwrap();
         let before = tree_snapshot(&old_bin);
 
-        let ops = RelocationOps {
-            copy_file: payload_copy_fails,
-            ..copy_only_ops()
-        };
-        let report = relocate_plan(&single_target_plan(&old_bin, &new_bin), ops).await;
+        let report = relocate_plan(&single_target_plan(&old_bin, &new_bin), copy_only_ops()).await;
 
         assert_eq!(report.moved_count, 0);
         assert_eq!(report.failures.len(), 1);
@@ -3741,7 +3698,7 @@ mod tests {
             old_entry.to_string_lossy().into_owned()
         );
         assert!(
-            report.failures[0].reason.contains("injected copy failure"),
+            report.failures[0].reason.contains("could not copy"),
             "{}",
             report.failures[0].reason
         );
@@ -3761,10 +3718,10 @@ mod tests {
         seed_relocation_bin(&old_bin, entry_id).await;
         let before = tree_snapshot(&old_bin);
 
-        let ops = RelocationOps {
-            digest_file: payload_digest_mismatches,
-            ..copy_only_ops()
-        };
+        // The read-back sees different bytes than the copy wrote.
+        let ops = ops_with_payload_read_back(|path| {
+            open_cache_bypassed(&manifest_path(path.parent().unwrap()))
+        });
         let report = relocate_plan(&single_target_plan(&old_bin, &new_bin), ops).await;
 
         assert_eq!(report.moved_count, 0);
@@ -3778,6 +3735,68 @@ mod tests {
         assert!(
             !new_bin.join(entry_id).exists(),
             "the unverified copy is removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn relocation_refuses_a_copy_it_could_only_sample() {
+        let tmp = TempDir::new().unwrap();
+        let old_bin = tmp.path().join("old-bin");
+        let new_bin = tmp.path().join("new-bin");
+        let entry_id = "20310102_030405000_smp111";
+        seed_relocation_bin(&old_bin, entry_id).await;
+        let before = tree_snapshot(&old_bin);
+
+        let ops = ops_with_payload_read_back(|_| {
+            ReadBackHandle::Unsupported("the read-back cannot run here".to_string())
+        });
+        let report = relocate_plan(&single_target_plan(&old_bin, &new_bin), ops).await;
+
+        assert_eq!(report.moved_count, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert!(
+            report.failures[0].reason.contains("verification failed"),
+            "{}",
+            report.failures[0].reason
+        );
+        assert_eq!(tree_snapshot(&old_bin), before, "the entry is left intact");
+        assert!(
+            !new_bin.join(entry_id).exists(),
+            "the unproven copy is removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn relocation_keeps_an_entry_that_changed_while_it_was_copied() {
+        let tmp = TempDir::new().unwrap();
+        let old_bin = tmp.path().join("old-bin");
+        let new_bin = tmp.path().join("new-bin");
+        let entry_id = "20310102_030405000_chg111";
+        let old_entry = seed_relocation_bin(&old_bin, entry_id).await;
+        let payload = old_entry.join("media.mkv");
+
+        // Same size, different bytes, written after the copy read the file.
+        let changed_payload = payload.clone();
+        let ops = ops_with_payload_read_back(move |path| {
+            std::fs::write(&changed_payload, b"MEDIA").unwrap();
+            open_cache_bypassed(path)
+        });
+        let report = relocate_plan(&single_target_plan(&old_bin, &new_bin), ops).await;
+
+        assert_eq!(report.moved_count, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert!(
+            report.failures[0]
+                .reason
+                .contains("changed while it was being copied"),
+            "{}",
+            report.failures[0].reason
+        );
+        assert_eq!(std::fs::read(&payload).unwrap(), b"MEDIA");
+        assert!(manifest_path(&old_entry).is_file(), "the entry is kept");
+        assert!(
+            !new_bin.join(entry_id).exists(),
+            "the copy of the earlier bytes is removed"
         );
     }
 
