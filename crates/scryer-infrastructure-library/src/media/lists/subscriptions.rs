@@ -198,44 +198,59 @@ impl ListSubscriptionRepository for ListStore {
         sync: &ListSyncStatus,
         counts: &ListCounts,
     ) -> AppResult<()> {
-        let args = vec![
-            SqlArg::Text(sync.state.as_str().to_string()),
-            SqlArg::OptTimestamp(sync.last_at),
-            SqlArg::OptTimestamp(sync.next_at),
-            SqlArg::OptText(sync.error_message.clone()),
-            SqlArg::OptTimestamp(sync.error_at),
-            SqlArg::OptTimestamp(sync.paused_until),
-            SqlArg::OptText(sync.fetch_fingerprint.clone()),
-            count_arg(counts.total),
-            count_arg(counts.in_library),
-            count_arg(counts.added),
-            count_arg(counts.requested),
-            count_arg(counts.held),
-            count_arg(counts.filtered),
-            count_arg(counts.excluded),
-            count_arg(counts.unresolved),
-            SqlArg::Text(id.to_string()),
-        ];
-        // `updated_at` is the last settings edit. The sync engine compares it
-        // with `last_sync_at` to spot an edit it has not processed yet, so a
-        // sync must not move it.
-        let changed = SqlRuntime::execute_write(
-            &self.datastore,
-            "record_list_sync",
-            "UPDATE list_subscriptions
-                SET sync_state = {}, last_sync_at = {}, next_sync_at = {}, error_message = {},
-                    error_at = {}, paused_until = {}, fetch_fingerprint = {},
-                    count_total = {}, count_in_library = {}, count_added = {},
-                    count_requested = {}, count_held = {}, count_filtered = {},
-                    count_excluded = {}, count_unresolved = {}
-              WHERE id = {}",
-            args,
-        )
-        .await?;
+        let mut args = sync_status_args(sync, counts);
+        args.push(SqlArg::Text(id.to_string()));
+        let changed =
+            SqlRuntime::execute_write(&self.datastore, "record_list_sync", RECORD_SYNC_SQL, args)
+                .await?;
         if changed == 0 {
             return Err(AppError::NotFound(format!("list subscription {id}")));
         }
         Ok(())
+    }
+
+    async fn record_sync_outcome(
+        &self,
+        id: &str,
+        read: &ListSyncStatus,
+        sync: &ListSyncStatus,
+        counts: &ListCounts,
+    ) -> AppResult<()> {
+        let id = id.to_string();
+        let read_next_at = read.next_at;
+        let sync = sync.clone();
+        let counts = *counts;
+        SqlRuntime::run_in_transaction(&self.datastore, "record_list_sync_outcome", move |tx| {
+            let id = id.clone();
+            let mut sync = sync.clone();
+            Box::pin(async move {
+                let lock = match tx {
+                    SqlTx::Postgres(_) => " FOR UPDATE",
+                    SqlTx::Sqlite(_) => "",
+                };
+                let row = SqlRuntime::fetch_optional(
+                    SqlExec::Tx(tx),
+                    &format!(
+                        "SELECT next_sync_at, fetch_fingerprint FROM list_subscriptions
+                          WHERE id = {{}}{lock}"
+                    ),
+                    &[SqlArg::Text(id.clone())],
+                )
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("list subscription {id}")))?;
+                let stored_next_at = row.opt_timestamp("next_sync_at")?;
+                if stored_next_at != read_next_at {
+                    // A sync was asked for while this one ran; keep it.
+                    sync.next_at = stored_next_at;
+                    sync.fetch_fingerprint = row.opt_text("fetch_fingerprint")?;
+                }
+                let mut args = sync_status_args(&sync, &counts);
+                args.push(SqlArg::Text(id));
+                SqlRuntime::execute(SqlExec::Tx(tx), RECORD_SYNC_SQL, &args).await?;
+                Ok(())
+            })
+        })
+        .await
     }
 
     async fn delete(&self, id: &str) -> AppResult<()> {
@@ -354,6 +369,38 @@ fn count_arg(value: u64) -> SqlArg {
 
 fn count_from(row: &SqlRow, column: &str) -> AppResult<u64> {
     Ok(row.i64(column)?.max(0) as u64)
+}
+
+// `updated_at` is the last settings edit. The sync engine compares it with
+// `last_sync_at` to spot an edit it has not processed yet, so a sync must not
+// move it.
+const RECORD_SYNC_SQL: &str = "UPDATE list_subscriptions
+    SET sync_state = {}, last_sync_at = {}, next_sync_at = {}, error_message = {},
+        error_at = {}, paused_until = {}, fetch_fingerprint = {},
+        count_total = {}, count_in_library = {}, count_added = {},
+        count_requested = {}, count_held = {}, count_filtered = {},
+        count_excluded = {}, count_unresolved = {}
+  WHERE id = {}";
+
+/// The arguments of [`RECORD_SYNC_SQL`] before the trailing id.
+fn sync_status_args(sync: &ListSyncStatus, counts: &ListCounts) -> Vec<SqlArg> {
+    vec![
+        SqlArg::Text(sync.state.as_str().to_string()),
+        SqlArg::OptTimestamp(sync.last_at),
+        SqlArg::OptTimestamp(sync.next_at),
+        SqlArg::OptText(sync.error_message.clone()),
+        SqlArg::OptTimestamp(sync.error_at),
+        SqlArg::OptTimestamp(sync.paused_until),
+        SqlArg::OptText(sync.fetch_fingerprint.clone()),
+        count_arg(counts.total),
+        count_arg(counts.in_library),
+        count_arg(counts.added),
+        count_arg(counts.requested),
+        count_arg(counts.held),
+        count_arg(counts.filtered),
+        count_arg(counts.excluded),
+        count_arg(counts.unresolved),
+    ]
 }
 
 /// Arbitrary key of the transaction-scoped Postgres lock that serializes

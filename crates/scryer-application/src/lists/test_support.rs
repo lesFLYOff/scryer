@@ -263,6 +263,29 @@ impl ListSubscriptionRepository for MemoryListStore {
         Ok(())
     }
 
+    async fn record_sync_outcome(
+        &self,
+        id: &str,
+        read: &ListSyncStatus,
+        sync: &ListSyncStatus,
+        counts: &ListCounts,
+    ) -> AppResult<()> {
+        if self.fail_record_sync_for.lock().unwrap().contains(id) {
+            return Err(AppError::Repository("fixture store failure".into()));
+        }
+        let mut rows = self.subscriptions.lock().unwrap();
+        if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+            let mut sync = sync.clone();
+            if row.sync.next_at != read.next_at {
+                sync.next_at = row.sync.next_at;
+                sync.fetch_fingerprint = row.sync.fetch_fingerprint.clone();
+            }
+            row.sync = sync;
+            row.counts = *counts;
+        }
+        Ok(())
+    }
+
     async fn delete(&self, id: &str) -> AppResult<()> {
         self.subscriptions
             .lock()

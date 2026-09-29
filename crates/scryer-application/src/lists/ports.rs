@@ -74,6 +74,20 @@ pub trait ListSubscriptionRepository: Send + Sync {
         counts: &ListCounts,
     ) -> AppResult<()>;
 
+    /// [`Self::record_sync`] for the outcome of a sync that read the list's
+    /// status as `read`. When the stored next sync time is no longer
+    /// `read.next_at`, a sync was asked for while this one ran ("sync now",
+    /// turning the list back on): the stored next sync time and fingerprint
+    /// are kept, so that request is not overwritten, and everything else is
+    /// written as given. The check and the write are one atomic step.
+    async fn record_sync_outcome(
+        &self,
+        id: &str,
+        read: &ListSyncStatus,
+        sync: &ListSyncStatus,
+        counts: &ListCounts,
+    ) -> AppResult<()>;
+
     /// Removes the subscription and, through the schema, its routes,
     /// memberships, list-scoped exclusions, and sync runs. Titles and requests
     /// are untouched.

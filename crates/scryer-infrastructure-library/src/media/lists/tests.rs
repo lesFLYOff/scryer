@@ -662,6 +662,78 @@ async fn exclusions_match_by_id_kind_and_scope() {
 }
 
 #[tokio::test]
+async fn a_sync_outcome_keeps_a_sync_requested_after_the_sync_read_the_list() {
+    let store = test_store(None).await;
+    let mut created = subscription("sub-1", ListScope::Public, OWNER);
+    let read_next = Utc::now() - Duration::minutes(5);
+    created.sync.next_at = Some(read_next);
+    created.sync.fetch_fingerprint = Some("fingerprint-read".into());
+    ListSubscriptionRepository::create(&store, created)
+        .await
+        .expect("create");
+    let read = ListSubscriptionRepository::get_by_id(&store, "sub-1")
+        .await
+        .unwrap()
+        .expect("stored")
+        .sync;
+
+    let finished = ListSyncStatus {
+        state: ListSyncState::Ok,
+        last_at: Some(Utc::now()),
+        next_at: Some(Utc::now() + Duration::hours(6)),
+        fetch_fingerprint: Some("fingerprint-new".into()),
+        ..ListSyncStatus::default()
+    };
+    let counts = ListCounts {
+        total: 3,
+        ..ListCounts::default()
+    };
+
+    // Nobody asked for a sync meanwhile: the outcome is written as given.
+    store
+        .record_sync_outcome("sub-1", &read, &finished, &counts)
+        .await
+        .expect("outcome");
+    let stored = ListSubscriptionRepository::get_by_id(&store, "sub-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.sync.next_at, finished.next_at);
+    assert_eq!(
+        stored.sync.fetch_fingerprint.as_deref(),
+        Some("fingerprint-new")
+    );
+
+    // "Sync now" lands after the next sync read the list.
+    let read = stored.sync.clone();
+    let requested_at = Utc::now();
+    let requested = ListSyncStatus {
+        next_at: Some(requested_at),
+        fetch_fingerprint: None,
+        ..read.clone()
+    };
+    store
+        .record_sync("sub-1", &requested, &counts)
+        .await
+        .expect("sync now");
+    store
+        .record_sync_outcome("sub-1", &read, &finished, &counts)
+        .await
+        .expect("outcome");
+    let stored = ListSubscriptionRepository::get_by_id(&store, "sub-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.sync.next_at.map(|at| at.timestamp_micros()),
+        Some(requested_at.timestamp_micros())
+    );
+    assert_eq!(stored.sync.fetch_fingerprint, None);
+    assert_eq!(stored.sync.state, ListSyncState::Ok);
+    assert_eq!(stored.counts.total, 3);
+}
+
+#[tokio::test]
 async fn a_source_can_be_followed_publicly_only_once() {
     let store = test_store(None).await;
     ListSubscriptionRepository::create(&store, subscription("sub-1", ListScope::Public, OWNER))

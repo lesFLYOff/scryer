@@ -234,7 +234,12 @@ pub async fn sync_subscription(
         };
         context
             .subscriptions
-            .record_sync(&subscription.id, &status, &subscription.counts)
+            .record_sync_outcome(
+                &subscription.id,
+                &subscription.sync,
+                &status,
+                &subscription.counts,
+            )
             .await?;
         run.outcome = ListSyncRunOutcome::Skipped;
         run.counts = subscription.counts;
@@ -386,7 +391,7 @@ pub async fn sync_subscription(
     };
     context
         .subscriptions
-        .record_sync(&subscription.id, &status, &counts)
+        .record_sync_outcome(&subscription.id, &subscription.sync, &status, &counts)
         .await?;
     run.counts = counts;
     finish_run(context, run, now).await?;
@@ -491,7 +496,12 @@ async fn record_unchanged(
     };
     context
         .subscriptions
-        .record_sync(&subscription.id, &status, &subscription.counts)
+        .record_sync_outcome(
+            &subscription.id,
+            &subscription.sync,
+            &status,
+            &subscription.counts,
+        )
         .await?;
     run.counts = subscription.counts;
     finish_run(context, run, now).await?;
@@ -519,7 +529,12 @@ async fn record_empty_fetch(
     };
     context
         .subscriptions
-        .record_sync(&subscription.id, &status, &subscription.counts)
+        .record_sync_outcome(
+            &subscription.id,
+            &subscription.sync,
+            &status,
+            &subscription.counts,
+        )
         .await?;
     run.counts = subscription.counts;
     run.error_message = Some(LIST_SYNC_EMPTY_FETCH_NOTE.to_string());
@@ -548,7 +563,12 @@ async fn record_storage_failure(
     };
     if let Err(error) = context
         .subscriptions
-        .record_sync(&subscription.id, &status, &subscription.counts)
+        .record_sync_outcome(
+            &subscription.id,
+            &subscription.sync,
+            &status,
+            &subscription.counts,
+        )
         .await
     {
         tracing::warn!(
@@ -609,7 +629,12 @@ async fn record_failure(
     };
     context
         .subscriptions
-        .record_sync(&subscription.id, &status, &subscription.counts)
+        .record_sync_outcome(
+            &subscription.id,
+            &subscription.sync,
+            &status,
+            &subscription.counts,
+        )
         .await?;
     run.outcome = ListSyncRunOutcome::Failed;
     run.counts = subscription.counts;

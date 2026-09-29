@@ -53,6 +53,33 @@ impl Harness {
     }
 }
 
+impl Harness {
+    /// Sync one subscription as a pass that read it as `read` would.
+    async fn sync_one_at(
+        &self,
+        read: &ListSubscription,
+        now: DateTime<Utc>,
+    ) -> SubscriptionSyncOutcome {
+        let provider = ScriptedProvider(self.lists.clone());
+        let charts = ScriptedCharts::default();
+        let context = ListSyncContext {
+            subscriptions: &self.store,
+            memberships: &self.store,
+            exclusions: &self.store,
+            accounts: &self.store,
+            policies: &self.store,
+            plugins: &provider,
+            charts: &charts,
+            resolver: &self.resolver,
+            actions: &self.actions,
+            provider_configs: &self.provider_configs,
+        };
+        sync_subscription(&context, read, now, None)
+            .await
+            .expect("sync one subscription")
+    }
+}
+
 fn rate_limited(retry_after_seconds: Option<i64>) -> PluginError {
     PluginError {
         code: PluginErrorCode::RateLimited,
@@ -1027,4 +1054,54 @@ async fn a_list_that_stays_due_is_tried_once_and_does_not_hide_the_rest() {
             ListMembershipState::Added
         );
     }
+}
+
+#[tokio::test]
+async fn a_sync_requested_while_a_sync_runs_survives_that_sync() {
+    let harness = Harness::new(vec![subscription("list-a")]);
+    harness.lists.serve("list-a", &["alpha"]);
+    harness.sync_at(at(0)).await;
+    // The pass reads the list when it is next due...
+    let read = harness.store.subscription("list-a");
+    assert!(read.sync.fetch_fingerprint.is_some());
+
+    // ...and "sync now" makes it due again and drops the fingerprint before
+    // that pass finishes.
+    let requested = ListSyncStatus {
+        next_at: Some(at(400)),
+        fetch_fingerprint: None,
+        ..read.sync.clone()
+    };
+    harness
+        .store
+        .record_sync("list-a", &requested, &read.counts)
+        .await
+        .expect("sync now");
+
+    harness.sync_one_at(&read, at(401)).await;
+
+    let list = harness.store.subscription("list-a");
+    assert_eq!(list.sync.next_at, Some(at(400)), "the request is still due");
+    assert_eq!(list.sync.fetch_fingerprint, None);
+    assert_eq!(
+        list.sync.last_at,
+        Some(at(401)),
+        "the finished sync is recorded"
+    );
+}
+
+#[tokio::test]
+async fn a_sync_nobody_raced_moves_the_next_sync_on() {
+    let harness = Harness::new(vec![subscription("list-a")]);
+    harness.lists.serve("list-a", &["alpha"]);
+    harness.sync_at(at(0)).await;
+    let read = harness.store.subscription("list-a");
+
+    harness.sync_one_at(&read, at(401)).await;
+
+    let list = harness.store.subscription("list-a");
+    assert_eq!(
+        list.sync.next_at,
+        Some(at(401) + chrono::Duration::hours(6))
+    );
 }
